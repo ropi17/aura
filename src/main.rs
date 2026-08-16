@@ -94,21 +94,18 @@ struct BotState {
     active_chats: std::collections::HashSet<ChatId>,
 
     // Client gRPC Aura
-    aura_clients: Option<AuraClients<AuthInterceptor, UserCtx>>,
+    aura_clients: Option<AuraClients<fn(Request<()>) -> Result<Request<()>, Status>, UserCtx>>,
 }
 
-#[derive(Clone)]
-struct AuthInterceptor {
-    api_key: String,
-}
+static API_KEY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
-impl Interceptor for AuthInterceptor {
-    fn call(&mut self, mut request: Request<()>) -> Result<Request<()>, Status> {
-        if let Ok(val) = self.api_key.parse::<tonic::metadata::MetadataValue<_>>() {
+fn auth_interceptor(mut request: Request<()>) -> Result<Request<()>, Status> {
+    if let Some(key) = API_KEY.get() {
+        if let Ok(val) = key.parse::<tonic::metadata::MetadataValue<_>>() {
             request.metadata_mut().insert("auth", val);
         }
-        Ok(request)
     }
+    Ok(request)
 }
 
 #[tokio::main]
@@ -118,6 +115,7 @@ async fn main() {
 
     let bot = Bot::from_env();
     let api_key = env::var("AURA_API_KEY").unwrap_or_else(|_| "DUMMY_KEY".to_string());
+    let _ = API_KEY.set(api_key.clone());
     let initial_mode = match env::var("AURA_MODE").unwrap_or_default().to_uppercase().as_str() {
         "MAINNET" => AppMode::Mainnet,
         _ => AppMode::Simulation,
@@ -131,8 +129,8 @@ async fn main() {
     if api_key != "DUMMY_KEY" {
         match Channel::from_static("http://trade.aura.rehab:40051").connect().await {
             Ok(channel) => {
-                let interceptor = AuthInterceptor { api_key: api_key.clone() };
-                let clients = AuraClients::<AuthInterceptor, UserCtx>::new(channel, interceptor);
+                let interceptor: fn(Request<()>) -> Result<Request<()>, Status> = auth_interceptor;
+                let clients = AuraClients::new(channel, interceptor);
                 aura_clients_opt = Some(clients);
                 info!("Berhasil terhubung ke Aura gRPC (trade.aura.rehab:40051)");
             }
@@ -170,9 +168,11 @@ async fn main() {
         // 1. Ping Loop (every 10 seconds)
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+            let mut ping_count = 0;
             loop {
                 interval.tick().await;
-                let req = Request::new(Ping {});
+                ping_count += 1;
+                let req = Request::new(Ping { count: ping_count });
                 let _ = clients_ping.aura().user_ping(req).await;
             }
         });
@@ -550,8 +550,8 @@ async fn handle_callback(
     if let Some(data) = q.data {
         let mut st = state.lock().await;
         st.limiter.until_ready().await;
-        let chat_id = if let Some(msg) = &q.message { msg.chat().id } else { return Ok(()); };
-        let msg_id  = if let Some(msg) = &q.message { msg.id() }      else { return Ok(()); };
+        let chat_id = if let Some(msg) = &q.message { msg.chat.id } else { return Ok(()); };
+        let msg_id  = if let Some(msg) = &q.message { msg.id }      else { return Ok(()); };
 
         // Register active chat
         st.active_chats.insert(chat_id);
