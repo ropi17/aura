@@ -30,6 +30,7 @@ enum Command {
 
 // State untuk menyimpan konfigurasi bot
 struct BotState {
+    #[allow(dead_code)]
     aura_api_key: String,
     mode: AppMode,
     // Rate limiter: Max 4 requests per second
