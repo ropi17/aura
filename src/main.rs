@@ -213,8 +213,9 @@ async fn handle_text_message(
             return Ok(());
         }
 
-        // Deteksi Solana Address (32 - 44 chars)
-        if text.len() >= 32 && text.len() <= 44 && !text.contains(" ") {
+        // Deteksi Solana Address (32 - 50 chars, base58 alphanumeric tanpa spasi)
+        let is_base58 = text.chars().all(|c| c.is_alphanumeric());
+        if text.len() >= 32 && text.len() <= 50 && !text.contains(" ") && is_base58 {
             st_locked.active_token = Some(text.to_string());
             send_limitbuy_menu(&bot, msg.chat.id, &text, &st_locked).await?;
         }
