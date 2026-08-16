@@ -107,6 +107,10 @@ fn make_autolimit_keyboard(is_active: bool) -> InlineKeyboardMarkup {
             InlineKeyboardButton::callback(format!("🤖 Auto Limit | {}", status_text), "toggle_autolimit"),
         ],
         vec![
+            InlineKeyboardButton::callback("⚡ Tip | 0.0015 SOL", "none"),
+            InlineKeyboardButton::callback("⛽ P.Fee | 0.0015 SOL", "none"),
+        ],
+        vec![
             InlineKeyboardButton::callback("🏄‍♂️ Slippage | 95%", "none"),
         ],
         vec![
