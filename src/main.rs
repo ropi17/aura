@@ -439,7 +439,7 @@ async fn handle_text_message(
                 let active = st.auto_limit_active;
                 let act_time = st.limit_act_time.clone();
                 let pnl = st.limit_target_pnl.clone();
-                bot.send_message(chat_id, format!("⚙️ **Pengaturan Auto Limit Sell**\nTarget PNL diubah ke **{}**", clean))
+                bot.send_message(msg.chat.id, format!("⚙️ **Pengaturan Auto Limit Sell**\nTarget PNL diubah ke **{}**", clean))
                     .reply_markup(make_autolimit_keyboard(active, tip, prio, &act_time, &pnl))
                     .await?;
             }
