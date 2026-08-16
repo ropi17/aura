@@ -11,6 +11,6 @@ pretty_env_logger = "0.5"
 governor = "0.6"
 nonzero_ext = "0.3"
 aura_api_client = { git = "https://github.com/in-aura-we-trade/aura_api_client.git" }
-tonic = "0.12"
+tonic = "0.14"
 tokio-stream = "0.1"
 prost = "0.13"

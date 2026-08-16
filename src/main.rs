@@ -8,7 +8,7 @@ use nonzero_ext::nonzero;
 use log::{info, error};
 
 use tonic::transport::Channel;
-use tonic::{Request, Status, service::Interceptor};
+use tonic::{Request, Status};
 use tokio_stream::StreamExt;
 
 // aura_api_client
