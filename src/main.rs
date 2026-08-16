@@ -26,7 +26,6 @@ enum Command {
     SimulateBuy,
 }
 
-// State untuk menyimpan konfigurasi bot
 struct BotState {
     #[allow(dead_code)]
     aura_api_key: String,
@@ -34,8 +33,14 @@ struct BotState {
     auto_limit_active: bool,
     limit_tip_fee: f64,
     limit_prio_fee: f64,
-    // Rate limiter: Max 4 requests per second
     limiter: Arc<governor::DefaultDirectRateLimiter>,
+    
+    // Manual Limit Buy Settings
+    active_token: Option<String>,
+    buy_amount_usd: f64,
+    buy_target_mcap: String,
+    buy_tip_fee: f64,
+    buy_prio_fee: f64,
 }
 
 #[tokio::main]
@@ -46,7 +51,6 @@ async fn main() {
     let bot = Bot::from_env(); 
 
     let api_key = env::var("AURA_API_KEY").unwrap_or_else(|_| "DUMMY_KEY".to_string());
-    
     let initial_mode = match env::var("AURA_MODE").unwrap_or_default().to_uppercase().as_str() {
         "MAINNET" => AppMode::Mainnet,
         _ => AppMode::Simulation,
@@ -62,10 +66,18 @@ async fn main() {
         limit_tip_fee: 0.0015,
         limit_prio_fee: 0.0015,
         limiter,
+        active_token: None,
+        buy_amount_usd: 2.0,
+        buy_target_mcap: "50 Mcap".to_string(),
+        buy_tip_fee: 0.001,
+        buy_prio_fee: 0.001,
     }));
 
     let handler = dptree::entry()
         .branch(Update::filter_message().filter_command::<Command>().endpoint(answer_command))
+        .branch(Update::filter_message().filter(|msg: Message| {
+            msg.text().is_some() && !msg.text().unwrap().starts_with('/')
+        }).endpoint(handle_text_message))
         .branch(Update::filter_callback_query().endpoint(handle_callback));
 
     Dispatcher::builder(bot, handler)
@@ -76,7 +88,6 @@ async fn main() {
         .await;
 }
 
-// Fungsi pembantu untuk membuat Keyboard Menu Utama
 fn make_main_menu_keyboard() -> InlineKeyboardMarkup {
     InlineKeyboardMarkup::new(vec![
         vec![
@@ -86,11 +97,9 @@ fn make_main_menu_keyboard() -> InlineKeyboardMarkup {
     ])
 }
 
-// Fungsi pembantu untuk membuat Keyboard Menu Swap Sell
 fn make_swapsell_keyboard() -> InlineKeyboardMarkup {
     InlineKeyboardMarkup::new(vec![
         vec![
-            // Tombol ini hanya sebagai display (callback "none"), karena fee di-fix.
             InlineKeyboardButton::callback("⚡ Tip | 0.0015 SOL", "none"),
             InlineKeyboardButton::callback("⛽ P.Fee | 0.0015 SOL", "none"),
         ],
@@ -103,7 +112,6 @@ fn make_swapsell_keyboard() -> InlineKeyboardMarkup {
     ])
 }
 
-// Fungsi pembantu untuk membuat Keyboard Menu Auto Limit
 fn make_autolimit_keyboard(is_active: bool, tip: f64, prio: f64) -> InlineKeyboardMarkup {
     let status_text = if is_active { "🟢 ON" } else { "🔴 OFF" };
     InlineKeyboardMarkup::new(vec![
@@ -123,6 +131,96 @@ fn make_autolimit_keyboard(is_active: bool, tip: f64, prio: f64) -> InlineKeyboa
     ])
 }
 
+fn make_limitbuy_keyboard(st: &BotState) -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![
+        vec![
+            InlineKeyboardButton::callback(format!("⚡ Tip | {} SOL", st.buy_tip_fee), "cycle_buy_tip"),
+            InlineKeyboardButton::callback(format!("⛽ P.Fee | {} SOL", st.buy_prio_fee), "cycle_buy_prio"),
+        ],
+        vec![
+            InlineKeyboardButton::callback("🏄‍♂️ Slippage | 90%", "none"),
+        ],
+        vec![
+            InlineKeyboardButton::callback("Side | BUY", "none"),
+            InlineKeyboardButton::callback("Dip", "none"),
+        ],
+        vec![
+            InlineKeyboardButton::callback("Activation | Instant", "none"),
+            InlineKeyboardButton::callback(format!("💰 {:.2} $", st.buy_amount_usd), "none"),
+        ],
+        vec![
+            InlineKeyboardButton::callback(format!("🎯 Target | {}", st.buy_target_mcap), "none"),
+        ],
+        vec![
+            InlineKeyboardButton::callback("📥 Place Order 📥", "place_limit_buy"),
+        ],
+        vec![
+            InlineKeyboardButton::callback("<< Back", "menu_main"),
+        ]
+    ])
+}
+
+async fn send_limitbuy_menu(bot: &Bot, chat_id: ChatId, token: &str, st: &BotState) -> ResponseResult<()> {
+    let text = format!("🏦 **Token:** `{}`\n💼 WALLET BALANCE: 0.116 SOL | 8.81$\n\n*(Ketik `5$` untuk ubah nominal beli, `1000 mcap` untuk ubah target, atau `0.002 sol` untuk ubah fee)*", token);
+    bot.send_message(chat_id, text)
+        .reply_markup(make_limitbuy_keyboard(st))
+        .await?;
+    Ok(())
+}
+
+async fn handle_text_message(
+    bot: Bot,
+    msg: Message,
+    state: Arc<Mutex<BotState>>,
+) -> ResponseResult<()> {
+    if let Some(text) = msg.text() {
+        let mut st_locked = state.lock().await;
+        st_locked.limiter.until_ready().await;
+        let text_lower = text.trim().to_lowercase();
+
+        if text_lower.ends_with('$') {
+            if let Ok(amount) = text_lower.trim_end_matches('$').trim().parse::<f64>() {
+                st_locked.buy_amount_usd = amount;
+                if let Some(token) = &st_locked.active_token {
+                    send_limitbuy_menu(&bot, msg.chat.id, token, &st_locked).await?;
+                } else {
+                    bot.send_message(msg.chat.id, "❌ Tidak ada token aktif. Paste address token dulu!").await?;
+                }
+            }
+            return Ok(());
+        }
+
+        if text_lower.contains("mcap") {
+            st_locked.buy_target_mcap = text.trim().to_string();
+            if let Some(token) = &st_locked.active_token {
+                send_limitbuy_menu(&bot, msg.chat.id, token, &st_locked).await?;
+            } else {
+                bot.send_message(msg.chat.id, "❌ Tidak ada token aktif. Paste address token dulu!").await?;
+            }
+            return Ok(());
+        }
+
+        if text_lower.ends_with("sol") {
+            if let Ok(amount) = text_lower.trim_end_matches("sol").trim().parse::<f64>() {
+                st_locked.buy_tip_fee = amount;
+                st_locked.buy_prio_fee = amount;
+                if let Some(token) = &st_locked.active_token {
+                    send_limitbuy_menu(&bot, msg.chat.id, token, &st_locked).await?;
+                } else {
+                    bot.send_message(msg.chat.id, "❌ Tidak ada token aktif. Paste address token dulu!").await?;
+                }
+            }
+            return Ok(());
+        }
+
+        // Deteksi Solana Address (32 - 44 chars)
+        if text.len() >= 32 && text.len() <= 44 && !text.contains(" ") {
+            st_locked.active_token = Some(text.to_string());
+            send_limitbuy_menu(&bot, msg.chat.id, &text, &st_locked).await?;
+        }
+    }
+    Ok(())
+}
 
 async fn answer_command(
     bot: Bot,
@@ -136,7 +234,7 @@ async fn answer_command(
             st.limiter.until_ready().await;
             let mode_str = if st.mode == AppMode::Mainnet { "MAINNET" } else { "SIMULASI" };
             
-            let text = format!("👋 **Selamat datang di Custom Aura Bot!**\nMode saat ini: `{}`\n\nSilakan pilih menu pengaturan di bawah ini:", mode_str);
+            let text = format!("👋 **Selamat datang di Custom Aura Bot!**\nMode saat ini: `{}`\n\nSilakan pilih menu atau **Paste Address Token** untuk Limit Buy.", mode_str);
             bot.send_message(msg.chat.id, text)
                 .reply_markup(make_main_menu_keyboard())
                 .await?;
@@ -172,21 +270,13 @@ async fn handle_callback(
         let mut st_locked = state.lock().await;
         st_locked.limiter.until_ready().await;
 
-        let chat_id = if let Some(msg) = &q.message {
-            msg.chat().id
-        } else {
-            return Ok(());
-        };
-        let msg_id = if let Some(msg) = &q.message {
-            msg.id()
-        } else {
-            return Ok(());
-        };
+        let chat_id = if let Some(msg) = &q.message { msg.chat().id } else { return Ok(()); };
+        let msg_id = if let Some(msg) = &q.message { msg.id() } else { return Ok(()); };
 
         match data.as_str() {
             "menu_main" => {
                 let mode_str = if st_locked.mode == AppMode::Mainnet { "MAINNET" } else { "SIMULASI" };
-                let text = format!("👋 **Selamat datang di Custom Aura Bot!**\nMode saat ini: `{}`\n\nSilakan pilih menu pengaturan di bawah ini:", mode_str);
+                let text = format!("👋 **Selamat datang di Custom Aura Bot!**\nMode saat ini: `{}`\n\nSilakan pilih menu atau **Paste Address Token** untuk Limit Buy.", mode_str);
                 
                 bot.edit_message_text(chat_id, msg_id, text)
                     .reply_markup(make_main_menu_keyboard())
@@ -195,7 +285,6 @@ async fn handle_callback(
             }
             "menu_swapsell" => {
                 let text = "⚙️ **Pengaturan Swap Sell**\nSemua pengaturan di bawah ini sudah **Fixed (Terkunci)** sesuai permintaan Anda untuk menghindari kerugian karena salah klik.";
-                
                 bot.edit_message_text(chat_id, msg_id, text)
                     .reply_markup(make_swapsell_keyboard())
                     .await?;
@@ -203,7 +292,6 @@ async fn handle_callback(
             }
             "menu_autolimit" => {
                 let text = "⚙️ **Pengaturan Auto Limit Order**\nSlippage terkunci di 95%. Silakan tekan tombol **Auto Limit** untuk Menghidupkan/Mematikan fitur ini.";
-                
                 bot.edit_message_text(chat_id, msg_id, text)
                     .reply_markup(make_autolimit_keyboard(st_locked.auto_limit_active, st_locked.limit_tip_fee, st_locked.limit_prio_fee))
                     .await?;
@@ -212,14 +300,12 @@ async fn handle_callback(
             "toggle_autolimit" => {
                 st_locked.auto_limit_active = !st_locked.auto_limit_active;
                 let text = "⚙️ **Pengaturan Auto Limit Order**\nSlippage terkunci di 95%. Silakan tekan tombol **Auto Limit** untuk Menghidupkan/Mematikan fitur ini.";
-                
                 bot.edit_message_text(chat_id, msg_id, text)
                     .reply_markup(make_autolimit_keyboard(st_locked.auto_limit_active, st_locked.limit_tip_fee, st_locked.limit_prio_fee))
                     .await?;
                 bot.answer_callback_query(q.id).text("Status Auto Limit diperbarui!").await?;
             }
             "cycle_limit_tip" => {
-                // Rotasi nilai Tip: 0.001 -> 0.0015 -> 0.002 -> 0.003 -> 0.005 -> 0.001
                 let vals = [0.001, 0.0015, 0.002, 0.003, 0.005];
                 let mut next_val = vals[0];
                 for (i, &v) in vals.iter().enumerate() {
@@ -229,15 +315,12 @@ async fn handle_callback(
                     }
                 }
                 st_locked.limit_tip_fee = next_val;
-                
-                let text = "⚙️ **Pengaturan Auto Limit Order**\nSlippage terkunci di 95%. Silakan tekan tombol **Auto Limit** untuk Menghidupkan/Mematikan fitur ini.";
-                bot.edit_message_text(chat_id, msg_id, text)
+                bot.edit_message_reply_markup(chat_id, msg_id)
                     .reply_markup(make_autolimit_keyboard(st_locked.auto_limit_active, st_locked.limit_tip_fee, st_locked.limit_prio_fee))
                     .await?;
                 bot.answer_callback_query(q.id).text(format!("Tip diubah ke {} SOL", next_val)).await?;
             }
             "cycle_limit_prio" => {
-                // Rotasi nilai P.Fee: 0.001 -> 0.0015 -> 0.002 -> 0.003 -> 0.005 -> 0.001
                 let vals = [0.001, 0.0015, 0.002, 0.003, 0.005];
                 let mut next_val = vals[0];
                 for (i, &v) in vals.iter().enumerate() {
@@ -247,16 +330,58 @@ async fn handle_callback(
                     }
                 }
                 st_locked.limit_prio_fee = next_val;
-                
-                let text = "⚙️ **Pengaturan Auto Limit Order**\nSlippage terkunci di 95%. Silakan tekan tombol **Auto Limit** untuk Menghidupkan/Mematikan fitur ini.";
-                bot.edit_message_text(chat_id, msg_id, text)
+                bot.edit_message_reply_markup(chat_id, msg_id)
                     .reply_markup(make_autolimit_keyboard(st_locked.auto_limit_active, st_locked.limit_tip_fee, st_locked.limit_prio_fee))
                     .await?;
                 bot.answer_callback_query(q.id).text(format!("P.Fee diubah ke {} SOL", next_val)).await?;
             }
+            "cycle_buy_tip" => {
+                let vals = [0.001, 0.0015, 0.002, 0.003, 0.005];
+                let mut next_val = vals[0];
+                for (i, &v) in vals.iter().enumerate() {
+                    if (st_locked.buy_tip_fee - v).abs() < f64::EPSILON {
+                        next_val = vals[(i + 1) % vals.len()];
+                        break;
+                    }
+                }
+                st_locked.buy_tip_fee = next_val;
+                bot.edit_message_reply_markup(chat_id, msg_id)
+                    .reply_markup(make_limitbuy_keyboard(&st_locked))
+                    .await?;
+                bot.answer_callback_query(q.id).text(format!("Buy Tip diubah ke {} SOL", next_val)).await?;
+            }
+            "cycle_buy_prio" => {
+                let vals = [0.001, 0.0015, 0.002, 0.003, 0.005];
+                let mut next_val = vals[0];
+                for (i, &v) in vals.iter().enumerate() {
+                    if (st_locked.buy_prio_fee - v).abs() < f64::EPSILON {
+                        next_val = vals[(i + 1) % vals.len()];
+                        break;
+                    }
+                }
+                st_locked.buy_prio_fee = next_val;
+                bot.edit_message_reply_markup(chat_id, msg_id)
+                    .reply_markup(make_limitbuy_keyboard(&st_locked))
+                    .await?;
+                bot.answer_callback_query(q.id).text(format!("Buy P.Fee diubah ke {} SOL", next_val)).await?;
+            }
+            "place_limit_buy" => {
+                let is_mainnet = st_locked.mode == AppMode::Mainnet;
+                if st_locked.active_token.is_none() {
+                    bot.answer_callback_query(q.id).text("Error: Token tidak aktif!").await?;
+                    return Ok(());
+                }
+                let response_text = if is_mainnet {
+                    format!("⚠️ [MAINNET] Mengirim perintah PLACE LIMIT BUY ke Aura!\nTarget: {}\nJumlah: ${:.2}", st_locked.buy_target_mcap, st_locked.buy_amount_usd)
+                } else {
+                    format!("🟢 [SIMULASI] Limit Buy Order Disimpan!\nTarget: {}\nJumlah: ${:.2}\n(Aman, tidak ada transaksi sungguhan).", st_locked.buy_target_mcap, st_locked.buy_amount_usd)
+                };
+                
+                bot.send_message(chat_id, response_text).await?;
+                bot.answer_callback_query(q.id).await?;
+            }
             "execute_swap_sell" => {
                 let is_mainnet = st_locked.mode == AppMode::Mainnet;
-                // Mengambil nilai fix
                 let prio_fee = 0.0015;
                 let tip = 0.0015;
                 let slippage = 95;
@@ -287,7 +412,6 @@ async fn handle_callback(
                 bot.answer_callback_query(q.id).text("PNL Berhasil diperbarui!").await?;
             }
             "none" => {
-                // Tombol yang bersifat pasif / hanya informasi
                 bot.answer_callback_query(q.id).text("Tombol ini dikunci (Fixed Setting).").await?;
             }
             _ => {}
