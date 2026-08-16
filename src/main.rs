@@ -1,11 +1,20 @@
+use std::env;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use teloxide::{prelude::*, utils::command::BotCommands};
 use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup};
-use tokio::sync::Mutex;
-use std::sync::Arc;
-use std::env;
 use governor::{Quota, RateLimiter};
 use nonzero_ext::nonzero;
-use log::info;
+use log::{info, error};
+
+use tonic::transport::Channel;
+use tonic::{Request, Status, service::Interceptor};
+use tokio_stream::StreamExt;
+
+// aura_api_client
+use aura_api_client::client::AuraClients;
+use aura_api_client::client_ext::UserCtx;
+use aura_api_client::types::{UserActionEventSub, Ping};
 
 #[derive(Clone, PartialEq)]
 enum AppMode {
@@ -80,6 +89,26 @@ struct BotState {
     // History of limit orders
     orders: Vec<LimitOrder>,
     next_order_id: usize,
+
+    // Active chats for notifications
+    active_chats: std::collections::HashSet<ChatId>,
+
+    // Client gRPC Aura
+    aura_clients: Option<AuraClients<AuthInterceptor, UserCtx>>,
+}
+
+#[derive(Clone)]
+struct AuthInterceptor {
+    api_key: String,
+}
+
+impl Interceptor for AuthInterceptor {
+    fn call(&mut self, mut request: Request<()>) -> Result<Request<()>, Status> {
+        if let Ok(val) = self.api_key.parse::<tonic::metadata::MetadataValue<_>>() {
+            request.metadata_mut().insert("auth", val);
+        }
+        Ok(request)
+    }
 }
 
 #[tokio::main]
@@ -96,6 +125,22 @@ async fn main() {
 
     let quota = Quota::per_second(nonzero!(4u32));
     let limiter = Arc::new(RateLimiter::direct(quota));
+
+    // Setup Aura gRPC Client
+    let mut aura_clients_opt = None;
+    if api_key != "DUMMY_KEY" {
+        match Channel::from_static("http://trade.aura.rehab:40051").connect().await {
+            Ok(channel) => {
+                let interceptor = AuthInterceptor { api_key: api_key.clone() };
+                let clients = AuraClients::<AuthInterceptor, UserCtx>::new(channel, interceptor);
+                aura_clients_opt = Some(clients);
+                info!("Berhasil terhubung ke Aura gRPC (trade.aura.rehab:40051)");
+            }
+            Err(e) => {
+                error!("Gagal koneksi ke gRPC Aura: {:?}", e);
+            }
+        }
+    }
 
     let state = Arc::new(Mutex::new(BotState {
         aura_api_key: api_key,
@@ -114,7 +159,61 @@ async fn main() {
         buy_prio_fee: 0.001,
         orders: Vec::new(),
         next_order_id: 1,
+        active_chats: std::collections::HashSet::new(),
+        aura_clients: aura_clients_opt.clone(),
     }));
+
+    // Start UserActivity Stream and Ping if client is available
+    if let Some(clients) = aura_clients_opt {
+        let clients_ping = clients.clone();
+        
+        // 1. Ping Loop (every 10 seconds)
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+            loop {
+                interval.tick().await;
+                let req = Request::new(Ping {});
+                let _ = clients_ping.aura().user_ping(req).await;
+            }
+        });
+
+        // 2. UserActivity Stream Listener
+        let st_clone = state.clone();
+        let bot_clone = bot.clone();
+        tokio::spawn(async move {
+            loop {
+                info!("Menyambungkan UserActivity Stream...");
+                let req = Request::new(UserActionEventSub {});
+                match clients.aura().user_activity(req).await {
+                    Ok(resp) => {
+                        let mut stream = resp.into_inner();
+                        info!("UserActivity Stream tersambung!");
+                        while let Some(msg) = stream.next().await {
+                            match msg {
+                                Ok(action) => {
+                                    // Kirim notifikasi ke semua chat yang aktif
+                                    let text = format!("🔔 **Aura Update**\n```\n{:?}\n```", action);
+                                    let chats = st_clone.lock().await.active_chats.clone();
+                                    for chat in chats {
+                                        let _ = bot_clone.send_message(chat, &text).await;
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("Stream message error: {:?}", e);
+                                    break; // keluar untuk reconnect
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("Gagal subscribe UserActivity: {:?}", e);
+                    }
+                }
+                // Tunggu sebelum mencoba koneksi ulang
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+        });
+    }
 
     let handler = dptree::entry()
         .branch(Update::filter_message().filter_command::<Command>().endpoint(answer_command))
@@ -317,6 +416,9 @@ async fn handle_text_message(
         let lower = text_trim.to_lowercase();
         let chat_id = msg.chat.id;
 
+        // Register active chat
+        st.active_chats.insert(chat_id);
+
         // Cek Address Token dulu
         let is_base58 = text_trim.chars().all(|c| c.is_alphanumeric());
         if text_trim.len() >= 32 && text_trim.len() <= 50 && !text_trim.contains(' ') && is_base58 {
@@ -450,6 +552,9 @@ async fn handle_callback(
         st.limiter.until_ready().await;
         let chat_id = if let Some(msg) = &q.message { msg.chat().id } else { return Ok(()); };
         let msg_id  = if let Some(msg) = &q.message { msg.id() }      else { return Ok(()); };
+
+        // Register active chat
+        st.active_chats.insert(chat_id);
 
         // Prefix routing for history order view & delete
         if data.starts_with("order_view_") {
