@@ -3,10 +3,9 @@ use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup};
 use tokio::sync::Mutex;
 use std::sync::Arc;
 use std::env;
-use std::time::Duration;
 use governor::{Quota, RateLimiter};
 use nonzero_ext::nonzero;
-use log::{info, warn};
+use log::info;
 
 #[derive(Clone, PartialEq)]
 enum AppMode {
@@ -23,7 +22,7 @@ enum Command {
     ModeSimulasi,
     #[command(description = "Ubah ke mode Mainnet (ASLI/LIVE).")]
     ModeMainnet,
-    #[command(description = "Pasang auto limit sell (contoh: /autolimit 100 50) -> jual 100% saat profit 50%.")]
+    #[command(parse_with = "split", description = "Pasang auto limit sell (contoh: /autolimit 100 50) -> jual 100% saat profit 50%.")]
     AutoLimit { amount_pct: f64, target_pnl: f64 },
     #[command(description = "Simulasi trigger limit buy kena.")]
     SimulateBuy,
@@ -137,7 +136,9 @@ async fn handle_callback(
                 } else {
                     "🟢 [SIMULASI] Swap Sell diproses (Aman, tidak ada transaksi sungguhan)."
                 };
-                bot.send_message(q.message.unwrap().chat.id, response_text).await?;
+                if let Some(msg) = &q.message {
+                    bot.send_message(msg.chat().id, response_text).await?;
+                }
                 bot.answer_callback_query(q.id).await?;
             }
             "refresh_pnl" => {
@@ -150,7 +151,7 @@ async fn handle_callback(
                 ]);
 
                 if let Some(msg) = q.message {
-                    bot.edit_message_text(msg.chat.id, msg.id, updated_text)
+                    bot.edit_message_text(msg.chat().id, msg.id(), updated_text)
                         .reply_markup(keyboard)
                         .await?;
                 }
