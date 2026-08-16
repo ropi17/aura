@@ -45,6 +45,8 @@ enum EditField {
     Mcap,
     Tip,
     Prio,
+    // Untuk Auto Limit edit
+    LimitPnl,
 }
 
 struct BotState {
@@ -54,6 +56,9 @@ struct BotState {
     auto_limit_active: bool,
     limit_tip_fee: f64,
     limit_prio_fee: f64,
+    // Auto Limit Sell — pengaturan yang bisa diubah user
+    limit_act_time: String,      // format: "0s", "5s", "10s", dll
+    limit_target_pnl: String,    // format: "50%", "100%", dll
     limiter: Arc<governor::DefaultDirectRateLimiter>,
 
     // Manual Limit Buy Settings (mode pembuatan order baru)
@@ -94,6 +99,8 @@ async fn main() {
         auto_limit_active: false,
         limit_tip_fee: 0.0015,
         limit_prio_fee: 0.0015,
+        limit_act_time: "0s".to_string(),
+        limit_target_pnl: "50%".to_string(),
         limiter,
         active_token: None,
         buy_amount_usd: 2.0,
@@ -146,18 +153,38 @@ fn make_swapsell_keyboard() -> InlineKeyboardMarkup {
     ])
 }
 
-fn make_autolimit_keyboard(is_active: bool, tip: f64, prio: f64) -> InlineKeyboardMarkup {
+fn make_autolimit_keyboard(is_active: bool, tip: f64, prio: f64, act_time: &str, target_pnl: &str) -> InlineKeyboardMarkup {
     let status_text = if is_active { "🟢 ON" } else { "🔴 OFF" };
     InlineKeyboardMarkup::new(vec![
+        // Sakelar ON/OFF
         vec![InlineKeyboardButton::callback(
-            format!("🤖 Auto Limit | {}", status_text),
+            format!("🤖 Auto Limit Sell | {}", status_text),
             "toggle_autolimit",
         )],
+        // Bisa diubah
         vec![
             InlineKeyboardButton::callback(format!("⚡ Tip | {} SOL", tip), "cycle_limit_tip"),
             InlineKeyboardButton::callback(format!("⛽ P.Fee | {} SOL", prio), "cycle_limit_prio"),
         ],
-        vec![InlineKeyboardButton::callback("🏄‍♂️ Slippage | 95%", "none")],
+        // Fixed display sesuai Aura
+        vec![InlineKeyboardButton::callback("🏄‍♂️ Slippage | 90%", "none")],
+        vec![
+            InlineKeyboardButton::callback(format!("⏰ Act.Time | {}", act_time), "cycle_limit_acttime"),
+            InlineKeyboardButton::callback("⌛ Order Expiry | 6d", "none"),
+        ],
+        vec![
+            InlineKeyboardButton::callback("Side | SELL%", "none"),
+            InlineKeyboardButton::callback("TakeProfit", "none"),
+        ],
+        vec![
+            InlineKeyboardButton::callback("Activation | Instant", "none"),
+            InlineKeyboardButton::callback("💰 100.0%", "none"),
+        ],
+        // Target PNL — bisa diubah dengan ketik n%pnl
+        vec![InlineKeyboardButton::callback(
+            format!("🎯 Target PNL | {}", target_pnl),
+            "set_limit_pnl",
+        )],
         vec![InlineKeyboardButton::callback("<< Back", "menu_main")],
     ])
 }
@@ -400,6 +427,25 @@ async fn handle_text_message(
             return Ok(());
         }
 
+        // ── Format n%pnl → ubah target PNL Auto Limit ────────────────────────
+        if lower.contains("%pnl") || lower.ends_with("%") {
+            if st.edit_field == EditField::LimitPnl {
+                // Bersihkan format jadi canonical misal "50%pnl" -> "50%"
+                let clean = lower.replace("%pnl", "%").trim().to_uppercase();
+                st.limit_target_pnl = clean.clone();
+                st.edit_field = EditField::None;
+                let tip = st.limit_tip_fee;
+                let prio = st.limit_prio_fee;
+                let active = st.auto_limit_active;
+                let act_time = st.limit_act_time.clone();
+                let pnl = st.limit_target_pnl.clone();
+                bot.send_message(chat_id, format!("⚙️ **Pengaturan Auto Limit Sell**\nTarget PNL diubah ke **{}**", clean))
+                    .reply_markup(make_autolimit_keyboard(active, tip, prio, &act_time, &pnl))
+                    .await?;
+            }
+            return Ok(());
+        }
+
         // ── Deteksi Solana Address ───────────────────────────────────────
         let is_base58 = trimmed.chars().all(|c| c.is_alphanumeric());
         if trimmed.len() >= 32 && trimmed.len() <= 50 && !trimmed.contains(' ') && is_base58 {
@@ -512,9 +558,15 @@ async fn handle_callback(
                 bot.answer_callback_query(q.id).await?;
             }
             "menu_autolimit" => {
-                let text = "⚙️ **Pengaturan Auto Limit Order**\nSlippage terkunci di 95%.";
+                let text = "⚙️ **Pengaturan Auto Limit Sell**\n\nSlippage, Side, Activation dikunci otomatis.\n\n*Klik 🎯 Target PNL untuk ubah, lalu ketik mis. `50%pnl`*";
                 bot.edit_message_text(chat_id, msg_id, text)
-                    .reply_markup(make_autolimit_keyboard(st.auto_limit_active, st.limit_tip_fee, st.limit_prio_fee))
+                    .reply_markup(make_autolimit_keyboard(
+                        st.auto_limit_active,
+                        st.limit_tip_fee,
+                        st.limit_prio_fee,
+                        &st.limit_act_time.clone(),
+                        &st.limit_target_pnl.clone(),
+                    ))
                     .await?;
                 bot.answer_callback_query(q.id).await?;
             }
@@ -530,25 +582,61 @@ async fn handle_callback(
             }
             "toggle_autolimit" => {
                 st.auto_limit_active = !st.auto_limit_active;
-                let text = "⚙️ **Pengaturan Auto Limit Order**\nSlippage terkunci di 95%.";
+                let text = "⚙️ **Pengaturan Auto Limit Sell**\n\nSlippage, Side, Activation dikunci otomatis.";
                 bot.edit_message_text(chat_id, msg_id, text)
-                    .reply_markup(make_autolimit_keyboard(st.auto_limit_active, st.limit_tip_fee, st.limit_prio_fee))
+                    .reply_markup(make_autolimit_keyboard(
+                        st.auto_limit_active,
+                        st.limit_tip_fee,
+                        st.limit_prio_fee,
+                        &st.limit_act_time.clone(),
+                        &st.limit_target_pnl.clone(),
+                    ))
                     .await?;
                 bot.answer_callback_query(q.id).text("Status Auto Limit diperbarui!").await?;
             }
             "cycle_limit_tip" => {
                 st.limit_tip_fee = cycle_fee(st.limit_tip_fee);
                 bot.edit_message_reply_markup(chat_id, msg_id)
-                    .reply_markup(make_autolimit_keyboard(st.auto_limit_active, st.limit_tip_fee, st.limit_prio_fee))
+                    .reply_markup(make_autolimit_keyboard(
+                        st.auto_limit_active, st.limit_tip_fee, st.limit_prio_fee,
+                        &st.limit_act_time.clone(), &st.limit_target_pnl.clone(),
+                    ))
                     .await?;
                 bot.answer_callback_query(q.id).text(format!("Tip → {} SOL", st.limit_tip_fee)).await?;
             }
             "cycle_limit_prio" => {
                 st.limit_prio_fee = cycle_fee(st.limit_prio_fee);
                 bot.edit_message_reply_markup(chat_id, msg_id)
-                    .reply_markup(make_autolimit_keyboard(st.auto_limit_active, st.limit_tip_fee, st.limit_prio_fee))
+                    .reply_markup(make_autolimit_keyboard(
+                        st.auto_limit_active, st.limit_tip_fee, st.limit_prio_fee,
+                        &st.limit_act_time.clone(), &st.limit_target_pnl.clone(),
+                    ))
                     .await?;
                 bot.answer_callback_query(q.id).text(format!("P.Fee → {} SOL", st.limit_prio_fee)).await?;
+            }
+            "cycle_limit_acttime" => {
+                let times = ["0s", "5s", "10s", "30s", "60s"];
+                let cur = st.limit_act_time.clone();
+                let mut next = times[0];
+                for (i, &t) in times.iter().enumerate() {
+                    if cur == t {
+                        next = times[(i + 1) % times.len()];
+                        break;
+                    }
+                }
+                st.limit_act_time = next.to_string();
+                bot.edit_message_reply_markup(chat_id, msg_id)
+                    .reply_markup(make_autolimit_keyboard(
+                        st.auto_limit_active, st.limit_tip_fee, st.limit_prio_fee,
+                        &st.limit_act_time.clone(), &st.limit_target_pnl.clone(),
+                    ))
+                    .await?;
+                bot.answer_callback_query(q.id).text(format!("Act.Time → {}", next)).await?;
+            }
+            "set_limit_pnl" => {
+                st.edit_field = EditField::LimitPnl;
+                bot.answer_callback_query(q.id).text("Ketik target PNL, contoh: 50%pnl").await?;
+                bot.send_message(chat_id, "✏️ **Ketik target PNL untuk Auto Limit Sell:**\nContoh: `50%pnl`, `100%pnl`, `200%pnl`").await?;
             }
             "cycle_buy_tip" => {
                 st.buy_tip_fee = cycle_fee(st.buy_tip_fee);
