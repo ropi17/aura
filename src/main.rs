@@ -32,6 +32,8 @@ struct BotState {
     aura_api_key: String,
     mode: AppMode,
     auto_limit_active: bool,
+    limit_tip_fee: f64,
+    limit_prio_fee: f64,
     // Rate limiter: Max 4 requests per second
     limiter: Arc<governor::DefaultDirectRateLimiter>,
 }
@@ -57,6 +59,8 @@ async fn main() {
         aura_api_key: api_key,
         mode: initial_mode,
         auto_limit_active: false,
+        limit_tip_fee: 0.0015,
+        limit_prio_fee: 0.0015,
         limiter,
     }));
 
@@ -100,15 +104,15 @@ fn make_swapsell_keyboard() -> InlineKeyboardMarkup {
 }
 
 // Fungsi pembantu untuk membuat Keyboard Menu Auto Limit
-fn make_autolimit_keyboard(is_active: bool) -> InlineKeyboardMarkup {
+fn make_autolimit_keyboard(is_active: bool, tip: f64, prio: f64) -> InlineKeyboardMarkup {
     let status_text = if is_active { "🟢 ON" } else { "🔴 OFF" };
     InlineKeyboardMarkup::new(vec![
         vec![
             InlineKeyboardButton::callback(format!("🤖 Auto Limit | {}", status_text), "toggle_autolimit"),
         ],
         vec![
-            InlineKeyboardButton::callback("⚡ Tip | 0.0015 SOL", "none"),
-            InlineKeyboardButton::callback("⛽ P.Fee | 0.0015 SOL", "none"),
+            InlineKeyboardButton::callback(format!("⚡ Tip | {} SOL", tip), "cycle_limit_tip"),
+            InlineKeyboardButton::callback(format!("⛽ P.Fee | {} SOL", prio), "cycle_limit_prio"),
         ],
         vec![
             InlineKeyboardButton::callback("🏄‍♂️ Slippage | 95%", "none"),
@@ -201,7 +205,7 @@ async fn handle_callback(
                 let text = "⚙️ **Pengaturan Auto Limit Order**\nSlippage terkunci di 95%. Silakan tekan tombol **Auto Limit** untuk Menghidupkan/Mematikan fitur ini.";
                 
                 bot.edit_message_text(chat_id, msg_id, text)
-                    .reply_markup(make_autolimit_keyboard(st_locked.auto_limit_active))
+                    .reply_markup(make_autolimit_keyboard(st_locked.auto_limit_active, st_locked.limit_tip_fee, st_locked.limit_prio_fee))
                     .await?;
                 bot.answer_callback_query(q.id).await?;
             }
@@ -210,9 +214,45 @@ async fn handle_callback(
                 let text = "⚙️ **Pengaturan Auto Limit Order**\nSlippage terkunci di 95%. Silakan tekan tombol **Auto Limit** untuk Menghidupkan/Mematikan fitur ini.";
                 
                 bot.edit_message_text(chat_id, msg_id, text)
-                    .reply_markup(make_autolimit_keyboard(st_locked.auto_limit_active))
+                    .reply_markup(make_autolimit_keyboard(st_locked.auto_limit_active, st_locked.limit_tip_fee, st_locked.limit_prio_fee))
                     .await?;
                 bot.answer_callback_query(q.id).text("Status Auto Limit diperbarui!").await?;
+            }
+            "cycle_limit_tip" => {
+                // Rotasi nilai Tip: 0.001 -> 0.0015 -> 0.002 -> 0.003 -> 0.005 -> 0.001
+                let vals = [0.001, 0.0015, 0.002, 0.003, 0.005];
+                let mut next_val = vals[0];
+                for (i, &v) in vals.iter().enumerate() {
+                    if (st_locked.limit_tip_fee - v).abs() < f64::EPSILON {
+                        next_val = vals[(i + 1) % vals.len()];
+                        break;
+                    }
+                }
+                st_locked.limit_tip_fee = next_val;
+                
+                let text = "⚙️ **Pengaturan Auto Limit Order**\nSlippage terkunci di 95%. Silakan tekan tombol **Auto Limit** untuk Menghidupkan/Mematikan fitur ini.";
+                bot.edit_message_text(chat_id, msg_id, text)
+                    .reply_markup(make_autolimit_keyboard(st_locked.auto_limit_active, st_locked.limit_tip_fee, st_locked.limit_prio_fee))
+                    .await?;
+                bot.answer_callback_query(q.id).text(format!("Tip diubah ke {} SOL", next_val)).await?;
+            }
+            "cycle_limit_prio" => {
+                // Rotasi nilai P.Fee: 0.001 -> 0.0015 -> 0.002 -> 0.003 -> 0.005 -> 0.001
+                let vals = [0.001, 0.0015, 0.002, 0.003, 0.005];
+                let mut next_val = vals[0];
+                for (i, &v) in vals.iter().enumerate() {
+                    if (st_locked.limit_prio_fee - v).abs() < f64::EPSILON {
+                        next_val = vals[(i + 1) % vals.len()];
+                        break;
+                    }
+                }
+                st_locked.limit_prio_fee = next_val;
+                
+                let text = "⚙️ **Pengaturan Auto Limit Order**\nSlippage terkunci di 95%. Silakan tekan tombol **Auto Limit** untuk Menghidupkan/Mematikan fitur ini.";
+                bot.edit_message_text(chat_id, msg_id, text)
+                    .reply_markup(make_autolimit_keyboard(st_locked.auto_limit_active, st_locked.limit_tip_fee, st_locked.limit_prio_fee))
+                    .await?;
+                bot.answer_callback_query(q.id).text(format!("P.Fee diubah ke {} SOL", next_val)).await?;
             }
             "execute_swap_sell" => {
                 let is_mainnet = st_locked.mode == AppMode::Mainnet;
