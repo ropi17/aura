@@ -10,7 +10,12 @@ log = "0.4"
 pretty_env_logger = "0.5"
 governor = "0.6"
 nonzero_ext = "0.3"
-aura_api_client = { git = "https://github.com/in-aura-we-trade/aura_api_client.git" }
+aura_api_client = { git = "https://github.com/in-aura-we-trade/aura_api_client.git", features = ["client", "client-generic", "api-types"], version = "0.1.0" }
 tonic = "0.14"
 tokio-stream = "0.1"
 prost = "0.13"
+dotenvy = "0.15.7"
+fastnum = "0.7.4"
+decisol = { git = "https://github.com/4r33x/decisol", version = "1.0.1" }
+solana-address = "2.7.0"
+rusqlite = { version = "0.40.2", features = ["bundled"] }

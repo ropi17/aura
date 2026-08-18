@@ -1,5 +1,6 @@
 use std::env;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Mutex;
 use teloxide::{prelude::*, utils::command::BotCommands};
 use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup};
@@ -7,14 +8,29 @@ use governor::{Quota, RateLimiter};
 use nonzero_ext::nonzero;
 use log::{info, error};
 
-use tonic::transport::Channel;
+use tonic::transport::Endpoint;
 use tonic::{Request, Status};
 use tokio_stream::StreamExt;
 
 // aura_api_client
 use aura_api_client::client::AuraClients;
-use aura_api_client::client_ext::UserCtx;
-use aura_api_client::types::{UserActionEventSub, Ping};
+use aura_api_client::client_ext::UserCtxInterceptor;
+use aura_api_client::types::UserActionEventSub;
+
+/// A no-op UserCtxInterceptor: all per-call context is handled by the
+/// connection-level `auth_interceptor` function, so we don't need a per-call payload.
+#[derive(Clone, Copy)]
+struct NoCtx;
+
+impl UserCtxInterceptor for NoCtx {
+    type Payload = ();
+    fn intercept<T>(_payload: (), _req: &mut tonic::Request<T>) -> Result<(), tonic::Status> {
+        Ok(())
+    }
+}
+
+mod db;
+use db::{init_db, load_settings, load_chats};
 
 #[derive(Clone, PartialEq)]
 enum AppMode {
@@ -33,6 +49,10 @@ enum Command {
     ModeMainnet,
     #[command(description = "Simulasi trigger limit buy kena.")]
     SimulateBuy,
+    #[command(description = "Bersihkan pesan sebelumnya untuk tampilan lebih rapi.")]
+    Clear,
+    #[command(description = "Tampilkan kembali panel Swap Sell jika tertumpuk.")]
+    Panel,
 }
 
 #[derive(Clone)]
@@ -41,8 +61,30 @@ struct LimitOrder {
     token: String,
     amount_usd: f64,
     target_mcap: String,
+    target_price: String,
     tip_fee: f64,
     prio_fee: f64,
+}
+
+/// Preset tip/prio untuk quick-set (Kecil/Sedang/Besar/Mega)
+#[derive(Clone)]
+struct TxPreset {
+    pub label: String,
+    pub tip: f64,
+    pub prio: f64,
+}
+
+impl TxPreset {
+    fn new(label: &str, tip: f64, prio: f64) -> Self {
+        TxPreset { label: label.to_string(), tip, prio }
+    }
+}
+
+/// Index preset aktif untuk quick-set buy (None = tidak ada yang aktif)
+#[derive(Clone, PartialEq)]
+enum ActivePreset {
+    None,
+    Idx(usize),
 }
 
 #[derive(Clone, PartialEq)]
@@ -53,23 +95,42 @@ enum EditField {
     BuyMcap,
     BuyTip,
     BuyPrio,
+    BuyTargetPrice,
+    // Quick preset editing (idx preset, field: 0=tip 1=prio)
+    BuyPresetTip(usize),
+    BuyPresetPrio(usize),
     // Auto Limit
     AutoTip,
     AutoPrio,
     AutoActTime,
     AutoPnl,
-    // History
+    // Swap Sell Panel
+    SellTip,
+    SellPrio,
+    SellSlippage,
+    // History edit (by DB id)
+    HistTarget(i64),
+    HistTipById(i64),
+    HistPrioById(i64),
+    // Limit Order Setup preset fields (idx: 0=kecil,1=sedang,2=besar,3=mega)
+    SetupPresetTip(usize),
+    SetupPresetPrio(usize),
+    // Legacy (kept for compat)
     HistAmount(usize),
     HistMcap(usize),
     HistTip(usize),
     HistPrio(usize),
 }
 
+type InterceptorFn = fn(Request<()>) -> Result<Request<()>, Status>;
+
 struct BotState {
+    aura_client: Option<AuraClients<InterceptorFn, NoCtx>>,
     #[allow(dead_code)]
     aura_api_key: String,
     mode: AppMode,
     limiter: Arc<governor::DefaultDirectRateLimiter>,
+    db_conn: Arc<Mutex<rusqlite::Connection>>,
     edit_field: EditField,
 
     // Auto Limit Sell Settings
@@ -79,22 +140,85 @@ struct BotState {
     limit_act_time: String,
     limit_target_pnl: String,
 
+    // Swap Sell Settings
+    sell_tip_fee: f64,
+    sell_prio_fee: f64,
+    sell_slippage: String,
+
     // Manual Limit Buy Settings (mode pembuatan order baru)
     active_token: Option<String>,
     buy_amount_usd: f64,
     buy_target_mcap: String,
+    buy_target_price: String,        // harga target limit buy, misal "0.00000002" atau notasi singkat "0.72"
     buy_tip_fee: f64,
     buy_prio_fee: f64,
 
-    // History of limit orders
+    // Quick-set presets untuk Tip & Prio (Kecil/Sedang/Besar/Mega)
+    buy_presets: Vec<TxPreset>,
+    buy_active_preset: ActivePreset,
+
+    // Preset values (from setup menu)
+    preset_kecil_tip: f64,
+    preset_kecil_prio: f64,
+    preset_sedang_tip: f64,
+    preset_sedang_prio: f64,
+    preset_besar_tip: f64,
+    preset_besar_prio: f64,
+    preset_mega_tip: f64,
+    preset_mega_prio: f64,
+
+    // History of limit orders (runtime cache, source of truth is db)
     orders: Vec<LimitOrder>,
     next_order_id: usize,
 
     // Active chats for notifications
     active_chats: std::collections::HashSet<ChatId>,
 
-    // Client gRPC Aura
-    aura_clients: Option<AuraClients<fn(Request<()>) -> Result<Request<()>, Status>, UserCtx>>,
+    // Track panel swap sell (chat_id, msg_id) agar bisa di-edit saat auto limit terpenuhi
+    swap_panel_msgs: Vec<(ChatId, teloxide::types::MessageId)>,
+
+    // Deduplikasi tx signature dari stream
+    processed_signatures: std::collections::HashSet<String>,
+}
+
+impl BotState {
+    pub fn get_db_settings(&self) -> db::DbSettings {
+        db::DbSettings {
+            auto_limit_active: self.auto_limit_active,
+            limit_tip_fee: self.limit_tip_fee,
+            limit_prio_fee: self.limit_prio_fee,
+            limit_act_time: self.limit_act_time.clone(),
+            limit_target_pnl: self.limit_target_pnl.clone(),
+            sell_tip_fee: self.sell_tip_fee,
+            sell_prio_fee: self.sell_prio_fee,
+            sell_slippage: self.sell_slippage.clone(),
+            preset_kecil_tip: self.preset_kecil_tip,
+            preset_kecil_prio: self.preset_kecil_prio,
+            preset_sedang_tip: self.preset_sedang_tip,
+            preset_sedang_prio: self.preset_sedang_prio,
+            preset_besar_tip: self.preset_besar_tip,
+            preset_besar_prio: self.preset_besar_prio,
+            preset_mega_tip: self.preset_mega_tip,
+            preset_mega_prio: self.preset_mega_prio,
+        }
+    }
+
+    pub fn save_db(&self) {
+        if let Ok(conn) = self.db_conn.try_lock() {
+            let set = self.get_db_settings();
+            let _ = db::save_settings(&conn, &set);
+        }
+    }
+
+    /// Sync buy_presets vec from the preset_* fields
+    pub fn sync_presets(&mut self) {
+        self.buy_presets = vec![
+            TxPreset::new("Kecil", self.preset_kecil_tip, self.preset_kecil_prio),
+            TxPreset::new("Sedang", self.preset_sedang_tip, self.preset_sedang_prio),
+            TxPreset::new("Besar", self.preset_besar_tip, self.preset_besar_prio),
+            TxPreset::new("Mega", self.preset_mega_tip, self.preset_mega_prio),
+        ];
+    }
 }
 
 static API_KEY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -110,11 +234,12 @@ fn auth_interceptor(mut request: Request<()>) -> Result<Request<()>, Status> {
 
 #[tokio::main]
 async fn main() {
+    dotenvy::dotenv().ok();
     pretty_env_logger::init();
     info!("Memulai Aura Custom Bot...");
 
     let bot = Bot::from_env();
-    let api_key = env::var("AURA_API_KEY").unwrap_or_else(|_| "DUMMY_KEY".to_string());
+    let api_key = env::var("AURA_API_KEY").unwrap_or_else(|_| "DUMMY_KEY".to_string()).trim().to_string();
     let _ = API_KEY.set(api_key.clone());
     let initial_mode = match env::var("AURA_MODE").unwrap_or_default().to_uppercase().as_str() {
         "MAINNET" => AppMode::Mainnet,
@@ -127,10 +252,14 @@ async fn main() {
     // Setup Aura gRPC Client
     let mut aura_clients_opt = None;
     if api_key != "DUMMY_KEY" {
-        match Channel::from_static("http://trade.aura.rehab:40051").connect().await {
+        let endpoint = Endpoint::from_static("http://trade.aura.rehab:40051")
+            .http2_keep_alive_interval(std::time::Duration::from_secs(30))
+            .keep_alive_timeout(std::time::Duration::from_secs(10))
+            .keep_alive_while_idle(true);
+        match endpoint.connect().await {
             Ok(channel) => {
                 let interceptor: fn(Request<()>) -> Result<Request<()>, Status> = auth_interceptor;
-                let clients = AuraClients::new(channel, interceptor);
+                let clients = AuraClients::<_, NoCtx>::new(channel, interceptor);
                 aura_clients_opt = Some(clients);
                 info!("Berhasil terhubung ke Aura gRPC (trade.aura.rehab:40051)");
             }
@@ -140,63 +269,477 @@ async fn main() {
         }
     }
 
-    let state = Arc::new(Mutex::new(BotState {
+    // Initialize Database
+    let conn = init_db().expect("Gagal inisialisasi SQLite database");
+    let loaded_settings = load_settings(&conn).unwrap_or_default();
+    
+    // Pre-populate active_chats dari env var TELEGRAM_CHAT_ID dan Database
+    let mut initial_chats = load_chats(&conn).unwrap_or_default();
+    if let Ok(chat_id_str) = env::var("TELEGRAM_CHAT_ID") {
+        for part in chat_id_str.split(',') {
+            if let Ok(id) = part.trim().parse::<i64>() {
+                initial_chats.insert(teloxide::types::ChatId(id));
+                let _ = db::save_chat(&conn, teloxide::types::ChatId(id));
+                info!("Chat ID {} ditambahkan dari env TELEGRAM_CHAT_ID", id);
+            }
+        }
+    }
+
+    let mut st = BotState {
         aura_api_key: api_key,
         mode: initial_mode,
+        aura_client: aura_clients_opt.clone(),
         limiter,
+        db_conn: Arc::new(Mutex::new(conn)),
         edit_field: EditField::None,
-        auto_limit_active: false,
-        limit_tip_fee: 0.0015,
-        limit_prio_fee: 0.0015,
-        limit_act_time: "0s".to_string(),
-        limit_target_pnl: "50%".to_string(),
+        auto_limit_active: loaded_settings.auto_limit_active,
+        limit_tip_fee: loaded_settings.limit_tip_fee,
+        limit_prio_fee: loaded_settings.limit_prio_fee,
+        limit_act_time: loaded_settings.limit_act_time,
+        limit_target_pnl: loaded_settings.limit_target_pnl,
+        sell_tip_fee: loaded_settings.sell_tip_fee,
+        sell_prio_fee: loaded_settings.sell_prio_fee,
+        sell_slippage: loaded_settings.sell_slippage,
+        preset_kecil_tip: loaded_settings.preset_kecil_tip,
+        preset_kecil_prio: loaded_settings.preset_kecil_prio,
+        preset_sedang_tip: loaded_settings.preset_sedang_tip,
+        preset_sedang_prio: loaded_settings.preset_sedang_prio,
+        preset_besar_tip: loaded_settings.preset_besar_tip,
+        preset_besar_prio: loaded_settings.preset_besar_prio,
+        preset_mega_tip: loaded_settings.preset_mega_tip,
+        preset_mega_prio: loaded_settings.preset_mega_prio,
         active_token: None,
         buy_amount_usd: 2.0,
         buy_target_mcap: "50 Mcap".to_string(),
+        buy_target_price: String::new(),
         buy_tip_fee: 0.001,
         buy_prio_fee: 0.001,
+        buy_presets: Vec::new(),
+        buy_active_preset: ActivePreset::None,
         orders: Vec::new(),
         next_order_id: 1,
-        active_chats: std::collections::HashSet::new(),
-        aura_clients: aura_clients_opt.clone(),
-    }));
+        active_chats: initial_chats,
+        swap_panel_msgs: Vec::new(),
+        processed_signatures: std::collections::HashSet::new(),
+    };
+    st.sync_presets();
+    let state = Arc::new(Mutex::new(st));
 
     // Start UserActivity Stream and Ping if client is available
     if let Some(clients) = aura_clients_opt {
         let clients_ping = clients.clone();
-        
-        // 1. Ping Loop (every 10 seconds)
+
+        // Shared flag: ping dimulai HANYA setelah stream user_activity tersambung
+        let stream_ready = Arc::new(AtomicBool::new(false));
+        let stream_ready_ping = stream_ready.clone();
+
+        // 1. Ping Loop — WAJIB setiap 10 detik per README Aura agar stream tetap hidup
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
-            let mut ping_count = 0;
+            use aura_api_client::types::Ping as AuraPing;
+            let mut ping_count: u64 = 0;
+            let mut consecutive_failures: u32 = 0;
             loop {
                 interval.tick().await;
+
+                // Tunggu sampai stream user_activity sudah tersambung
+                if !stream_ready_ping.load(Ordering::Relaxed) {
+                    info!("⏳ Menunggu UserActivity stream tersambung sebelum ping...");
+                    continue;
+                }
+
                 ping_count += 1;
-                let req = Request::new(Ping { count: ping_count });
-                let _ = clients_ping.aura().user_ping(req).await;
+                let req = Request::new(AuraPing { count: ping_count });
+                match clients_ping.aura().user_ping((), req).await {
+                    Ok(_) => {
+                        consecutive_failures = 0;
+                        if ping_count == 1 {
+                            info!("✅ Ping pertama ke server Aura berhasil! Stream aktif.");
+                        }
+                    }
+                    Err(e) => {
+                        consecutive_failures += 1;
+                        error!("❌ Gagal ping Aura (#{ping_count}): {:?}", e);
+                        // Jika gagal >3x berturut, reset flag stream agar listener bisa reconnect
+                        if consecutive_failures >= 3 {
+                            error!("⚠️ Ping gagal {} kali berturut — reset stream_ready flag", consecutive_failures);
+                            stream_ready_ping.store(false, Ordering::Relaxed);
+                            consecutive_failures = 0;
+                        }
+                    }
+                }
             }
         });
 
         // 2. UserActivity Stream Listener
+
         let st_clone = state.clone();
         let bot_clone = bot.clone();
+        let stream_ready_listener = stream_ready.clone();
         tokio::spawn(async move {
             loop {
                 info!("Menyambungkan UserActivity Stream...");
                 let req = Request::new(UserActionEventSub {});
-                match clients.aura().user_activity(req).await {
+                match clients.aura().user_activity((), req).await {
                     Ok(resp) => {
                         let mut stream = resp.into_inner();
                         info!("UserActivity Stream tersambung!");
+                        // Aktifkan flag → ping loop bisa mulai
+                        stream_ready_listener.store(true, Ordering::Relaxed);
                         while let Some(msg) = stream.next().await {
                             match msg {
                                 Ok(action) => {
-                                    // Kirim notifikasi ke semua chat yang aktif
-                                    let text = format!("🔔 **Aura Update**\n```\n{:?}\n```", action);
-                                    let chats = st_clone.lock().await.active_chats.clone();
-                                    for chat in chats {
-                                        let _ = bot_clone.send_message(chat, &text).await;
+                                    use aura_api_client::types::{
+                                        UserAction, TradeStateUpdate, TxnConfirmState,
+                                        ParsedTradeUi,
+                                    };
+
+                                    // ── Pong/Ping: log saja, skip ──
+                                    if matches!(action, UserAction::Pong(_) | UserAction::Ping(_)) {
+                                        continue;
                                     }
+
+                                    // ── SELALU log ke server (bukan Telegram) ──
+                                    info!("[Aura Stream] {:?}", action);
+
+                                    // ── Deteksi SELL on-chain (auto limit terpenuhi) ──
+                                    // Ini harus dicek SEBELUM BUY agar tidak tertukar
+                                    if let UserAction::TradeCallback(TradeStateUpdate::Landed {
+                                        state: TxnConfirmState::Confirmed { trades, .. }, ..
+                                    }) = &action {
+                                        let has_sell = trades.iter().any(|t| matches!(t, ParsedTradeUi::Sell { .. }));
+                                        if has_sell {
+                                            // Ambil detail sell dari trade pertama yang Sell
+                                            let sell_info = trades.iter().find_map(|t| {
+                                                if let ParsedTradeUi::Sell { mint, ticker, quote, pnl, .. } = t {
+                                                    Some((format!("{}", mint), ticker.clone(), quote.clone(), pnl.clone()))
+                                                } else {
+                                                    None
+                                                }
+                                            });
+
+                                            if let Some((mint_str, ticker, quote_val, pnl_val)) = sell_info {
+                                                info!("[Aura Stream] Terdeteksi SELL berhasil on-chain! Token={}", mint_str);
+
+                                                let (panel_msgs, chats) = {
+                                                    let st = st_clone.lock().await;
+                                                    (st.swap_panel_msgs.clone(), st.active_chats.clone())
+                                                };
+
+                                                let pnl_str = pnl_val
+                                                    .map(|p| format!("{:.2}", p))
+                                                    .unwrap_or_else(|| "N/A".to_string());
+
+                                                // quote adalah QuoteLamports (lamports token quote / SOL)
+                                                // format sebagai SOL (÷ 1e9)
+                                                let sol_received = {
+                                                    let raw: u64 = quote_val.into();
+                                                    raw as f64 / 1e9
+                                                };
+
+                                                let ticker_display = if ticker.is_empty() {
+                                                    let s = &mint_str;
+                                                    format!("{}...{}", &s[..6.min(s.len())], &s[s.len().saturating_sub(4)..])
+                                                } else {
+                                                    ticker.clone()
+                                                };
+
+                                                let sold_text = format!(
+                                                    "✅ *Token Terjual via Auto Limit!*\n\n\
+                                                    🏦 Token: `{}` ({})\n\
+                                                    💰 SOL Diterima: `{:.6}` SOL\n\
+                                                    📈 PNL: `{}%`\n\n\
+                                                    _Auto Limit Sell telah dieksekusi otomatis oleh Aura._",
+                                                    ticker_display, mint_str, sol_received, pnl_str
+                                                );
+
+                                                // Edit semua panel swap sell yang tersimpan
+                                                for (chat_id, msg_id) in &panel_msgs {
+                                                    let _ = bot_clone
+                                                        .edit_message_text(*chat_id, *msg_id, &sold_text)
+                                                        .await;
+                                                }
+
+                                                // Jika tidak ada panel tersimpan, kirim pesan baru
+                                                if panel_msgs.is_empty() {
+                                                    for chat in &chats {
+                                                        let _ = bot_clone.send_message(*chat, &sold_text).await;
+                                                    }
+                                                }
+
+                                                // Clear panel msgs setelah terjual
+                                                {
+                                                    let mut st = st_clone.lock().await;
+                                                    st.swap_panel_msgs.clear();
+                                                }
+                                                continue; // skip ke event berikutnya
+                                            }
+                                        }
+                                    }
+
+                                    // ── Deteksi event BUY yang presisi berdasarkan enum proto ──
+                                    // Hanya menggunakan TradeCallback::Landed agar terpicu 1x saat tx sukses on-chain
+                                    let (is_buy_confirmed, mint_from_event, txn_sig_opt) = match &action {
+                                        UserAction::TradeCallback(update) => {
+                                            match update {
+                                                TradeStateUpdate::Landed { signature, state } => {
+                                                    match state {
+                                                        TxnConfirmState::Confirmed { trades, .. } => {
+                                                            let has_buy = trades.iter().any(|t| matches!(t, ParsedTradeUi::Buy { .. }));
+                                                            let mint_str = trades.iter().find_map(|t| {
+                                                                if let ParsedTradeUi::Buy { mint, .. } = t {
+                                                                    Some(format!("{}", mint))
+                                                                } else {
+                                                                    None
+                                                                }
+                                                            });
+                                                            (has_buy, mint_str, Some(format!("{}", signature)))
+                                                        }
+                                                        _ => (false, None, None),
+                                                    }
+                                                }
+                                                TradeStateUpdate::Lost { .. } => (false, None, None),
+                                            }
+                                        }
+                                        _ => (false, None, None),
+                                    };
+
+                                    if is_buy_confirmed {
+                                        let sig = txn_sig_opt.unwrap_or_else(|| "unknown".to_string());
+                                        // Deduplikasi berdasarkan signature
+                                        {
+                                            let mut st = st_clone.lock().await;
+                                            if st.processed_signatures.contains(&sig) {
+                                                continue;
+                                            }
+                                            st.processed_signatures.insert(sig.clone());
+                                        }
+                                        
+                                        info!("[Aura Stream] Terdeteksi transaksi BUY berhasil! Sig: {}", sig);
+
+                                        // Ambil settings dari state
+                                        let (active_token, auto_limit_active, limit_tip, limit_prio, limit_pnl, _limit_time, chats) = {
+                                            let mut st = st_clone.lock().await;
+                                            if let Some(ref mint) = mint_from_event {
+                                                if mint.len() >= 32 {
+                                                    st.active_token = Some(mint.clone());
+                                                }
+                                            }
+                                            (
+                                                st.active_token.clone(),
+                                                st.auto_limit_active,
+                                                st.limit_tip_fee,
+                                                st.limit_prio_fee,
+                                                st.limit_target_pnl.clone(),
+                                                st.limit_act_time.clone(),
+                                                st.active_chats.clone(),
+                                            )
+                                        };
+
+                                        let token_display = active_token.as_deref().unwrap_or("Unknown Token");
+
+                                        // Persiapkan Teks Swap Panel (belum dikirim)
+                                        let auto_info = if auto_limit_active {
+                                            format!("🤖 Auto Limit Sell aktif — target PNL {}%\n\n", limit_pnl)
+                                        } else {
+                                            String::new()
+                                        };
+                                        let swap_text = format!(
+                                            "🟢 *Pembelian Terdeteksi!*\n\n🏦 Token: `{}`\n\n{}*Klik tombol di bawah untuk Swap Sell atau lihat PNL:*",
+                                            token_display, auto_info
+                                        );
+                                        let swap_keyboard = teloxide::types::InlineKeyboardMarkup::new(vec![
+                                            vec![teloxide::types::InlineKeyboardButton::callback(
+                                                "🔴 Confirm Swap Sell", "execute_swap_sell",
+                                            )],
+                                            vec![teloxide::types::InlineKeyboardButton::callback(
+                                                "🔄 Refresh PNL", "refresh_pnl",
+                                            )],
+                                        ]);
+
+                                        // ── Auto Limit Sell: tempatkan order ke Aura gRPC jika aktif ──
+                                        if auto_limit_active {
+                                            if let Some(ref token) = active_token {
+                                                use aura_api_client::types::{
+                                                    ApiLimitOrder, ApiOrders, Direction, OrderEventTrigger,
+                                                    OrderState, RawOrder, SwapAmount, Target, TxnProcessors,
+                                                    UpdateTokenLimitOrders, UserNonceStrategy,
+                                                };
+                                                use std::str::FromStr;
+
+                                                let mut st = st_clone.lock().await;
+                                                let order_id = st.next_order_id;
+                                                let sell_slippage = st.sell_slippage.clone();
+                                                let new_order = LimitOrder {
+                                                    id: order_id,
+                                                    token: token.clone(),
+                                                    amount_usd: 100.0,
+                                                    target_mcap: format!("PNL {}%", limit_pnl),
+                                                    target_price: String::new(),
+                                                    tip_fee: limit_tip,
+                                                    prio_fee: limit_prio,
+                                                };
+                                                st.orders.push(new_order.clone());
+                                                st.next_order_id += 1;
+                                                // Save to SQLite
+                                                let db_conn_clone = st.db_conn.clone();
+                                                if let Ok(conn) = db_conn_clone.try_lock() {
+                                                    let _ = db::insert_limit_order(&conn, "SELL", token, &format!("PNL {}%", limit_pnl), limit_tip, limit_prio);
+                                                }
+                                                let client_opt = st.aura_client.clone();
+                                                let db_conn_for_err = st.db_conn.clone();
+                                                drop(st);
+
+                                                info!(
+                                                    "[Auto Limit] Order #{} akan dikirim ke Aura: Token={}, PNL={}%, Tip={}, Prio={}",
+                                                    order_id, token, limit_pnl, limit_tip, limit_prio
+                                                );
+
+                                                // Kirim ke Aura gRPC
+                                                if let Some(client) = client_opt {
+                                                    if let Ok(mint_addr) = solana_address::Address::from_str(token) {
+                                                        let tip_lam = (limit_tip * 1e9) as u64;
+                                                        let prio_lam = (limit_prio * 1e9) as u64;
+
+                                                        let pnl_f64 = limit_pnl.parse::<f64>().unwrap_or(100.0);
+                                                        let pnl_scaled = ((1.0 + pnl_f64 / 100.0) * 1_000_000f64) as u64;
+                                                        let profit_perc = fastnum::UD128::from(pnl_scaled) / fastnum::UD128::from(1_000_000u64);
+
+                                                        let slippage_f64 = sell_slippage.replace("%", "").trim().parse::<f64>().unwrap_or(90.0);
+                                                        let slippage_scaled = (slippage_f64 / 100.0 * 1_000_000.0) as u64;
+                                                        let slippage_val = fastnum::UD128::from(slippage_scaled) / fastnum::UD128::from(1_000_000u64);
+
+                                                        let api_order = ApiLimitOrder {
+                                                            state: OrderState::Api {
+                                                                id: None,
+                                                                expire_dur: None,
+                                                                activate_dur: None,
+                                                            },
+                                                            order: RawOrder {
+                                                                slippage: slippage_val,
+                                                                tip: decisol::Lamports::from(tip_lam),
+                                                                fee: decisol::Lamports::from(prio_lam),
+                                                                target: Target::Profit {
+                                                                    init_profit_perc: profit_perc,
+                                                                    recalced_profit: None,
+                                                                    direction: Direction::Above,
+                                                                },
+                                                                amount: SwapAmount::SellPerc { amount: fastnum::udec128!(1) },
+                                                                procs: TxnProcessors {
+                                                                    jito_validators: false,
+                                                                    jito_bundled: false,
+                                                                    aura: true,
+                                                                    bloxroute: false,
+                                                                    nozomi: false,
+                                                                    next_block: false,
+                                                                    slot0: false,
+                                                                    astra: false,
+                                                                    block_razor: false,
+                                                                    node1: false,
+                                                                    tpu_penetrator: false,
+                                                                    helius: true,
+                                                                    stellium: true,
+                                                                    soyas: true,
+                                                                    falcon: true,
+                                                                    raiden: true,
+                                                                    circular: true,
+                                                                    flash_block: true,
+                                                                    moon: true,
+                                                                    blocksprint: true,
+                                                                    aura_revert: false,
+                                                                    landx: true,
+                                                                    manka: true,
+                                                                    blockrush: true,
+                                                                },
+                                                                nonce: UserNonceStrategy::Hybrid,
+                                                                slot_latency: 0,
+                                                            },
+                                                            trigger: OrderEventTrigger::Immediate,
+                                                            wallet: mint_addr,
+                                                        };
+
+                                                        let req = tonic::Request::new(UpdateTokenLimitOrders {
+                                                            mint: mint_addr,
+                                                            orders: ApiOrders { orders: vec![api_order] },
+                                                        });
+
+                                                        let short = if token.len() >= 10 {
+                                                            format!("{}...{}", &token[..6], &token[token.len()-4..])
+                                                        } else {
+                                                            token.clone()
+                                                        };
+
+                                                        match client.limit_orders().place_limit_orders((), req).await {
+                                                            Ok(_) => {
+                                                                let auto_text = format!(
+                                                                    "🤖 *Auto Limit Sell Ditempatkan ke Aura!*\n\n🏦 Token: `{}`\n🎯 Target PNL: {}%\n⚡ Tip: {} SOL\n⛽ P.Fee: {} SOL\n📋 Order ID: #{}\n\n_Bot akan otomatis menjual ketika target terpenuhi._",
+                                                                    short, limit_pnl, limit_tip, limit_prio, order_id
+                                                                );
+                                                                for chat in &chats {
+                                                                    let _ = bot_clone.send_message(*chat, &auto_text).await;
+                                                                }
+                                                            }
+                                                            Err(e) => {
+                                                                let err_text = format!(
+                                                                    "❌ Gagal menempatkan Auto Limit Sell ke Aura!\n🏦 Token: `{}`\n🔴 Error: {}",
+                                                                    short, e.message()
+                                                                );
+                                                                // Save error log to SQLite
+                                                                if let Ok(conn) = db_conn_for_err.try_lock() {
+                                                                    let _ = db::insert_error_log(&conn, order_id as i64, &token, e.message());
+                                                                }
+                                                                for chat in &chats {
+                                                                    let _ = bot_clone.send_message(*chat, &err_text).await;
+                                                                }
+                                                                error!("[Auto Limit] Gagal place_limit_orders: {:?}", e);
+                                                            }
+                                                        }
+                                                    } else {
+                                                        error!("[Auto Limit] Mint address '{}' tidak valid", token);
+                                                    }
+                                                } else {
+                                                    error!("[Auto Limit] Tidak ada koneksi Aura gRPC aktif");
+                                                }
+                                            }
+                                        }
+
+                                        // ── Kirim Swap Sell Panel ke Telegram & simpan msg_id ──
+                                        let auto_info = if auto_limit_active {
+                                            format!("🤖 Auto Limit Sell aktif — target PNL {}%\n\n", limit_pnl)
+                                        } else {
+                                            String::new()
+                                        };
+                                        let swap_text = format!(
+                                            "🟢 *Pembelian Terdeteksi!*\n\n🏦 Token: `{}`\n\n{}*Klik tombol di bawah untuk Swap Sell atau lihat PNL:*",
+                                            token_display, auto_info
+                                        );
+                                        let swap_keyboard = teloxide::types::InlineKeyboardMarkup::new(vec![
+                                            vec![teloxide::types::InlineKeyboardButton::callback(
+                                                "🔴 Confirm Swap Sell", "execute_swap_sell",
+                                            )],
+                                            vec![teloxide::types::InlineKeyboardButton::callback(
+                                                "🔄 Refresh PNL", "refresh_pnl",
+                                            )],
+                                        ]);
+
+                                        // Kirim panel dan simpan msg_id
+                                        let mut new_panels = Vec::new();
+                                        for chat in &chats {
+                                            if let Ok(sent) = bot_clone
+                                                .send_message(*chat, &swap_text)
+                                                .reply_markup(swap_keyboard.clone())
+                                                .await
+                                            {
+                                                new_panels.push((*chat, sent.id));
+                                            }
+                                        }
+                                        // Simpan ke state
+                                        {
+                                            let mut st = st_clone.lock().await;
+                                            st.swap_panel_msgs.extend(new_panels);
+                                        }
+                                    }
+                                    // ── Semua event lain: hanya log, TIDAK kirim ke Telegram ──
                                 }
                                 Err(e) => {
                                     error!("Stream message error: {:?}", e);
@@ -204,9 +747,13 @@ async fn main() {
                                 }
                             }
                         }
+                        // Stream terputus — nonaktifkan flag agar ping tidak jalan saat reconnect
+                        stream_ready_listener.store(false, Ordering::Relaxed);
+                        info!("UserActivity Stream terputus, akan reconnect dalam 5 detik...");
                     }
                     Err(e) => {
                         error!("Gagal subscribe UserActivity: {:?}", e);
+                        stream_ready_listener.store(false, Ordering::Relaxed);
                     }
                 }
                 // Tunggu sebelum mencoba koneksi ulang
@@ -238,17 +785,24 @@ fn make_main_menu_keyboard() -> InlineKeyboardMarkup {
             InlineKeyboardButton::callback("🔄 Swap Sell", "menu_swapsell"),
             InlineKeyboardButton::callback("🤖 Auto Limit Order", "menu_autolimit"),
         ],
-        vec![InlineKeyboardButton::callback("📋 Limit Order History", "menu_history")],
+        vec![
+            InlineKeyboardButton::callback("📋 Limit Order History", "menu_history"),
+            InlineKeyboardButton::callback("⚙️ Limit Order Setup", "menu_lo_setup"),
+        ],
+        vec![InlineKeyboardButton::callback("📜 Limit Order Logs", "menu_lo_logs")],
     ])
 }
 
-fn make_swapsell_keyboard() -> InlineKeyboardMarkup {
+fn make_swapsell_keyboard(st: &BotState) -> InlineKeyboardMarkup {
     InlineKeyboardMarkup::new(vec![
         vec![
-            InlineKeyboardButton::callback("⚡ Tip | 0.0015 SOL", "none"),
-            InlineKeyboardButton::callback("⛽ P.Fee | 0.0015 SOL", "none"),
+            InlineKeyboardButton::callback(format!("⚡ Tip | {} SOL", st.sell_tip_fee), "edit_sell_tip"),
+            InlineKeyboardButton::callback(format!("⛽ P.Fee | {} SOL", st.sell_prio_fee), "edit_sell_prio"),
         ],
-        vec![InlineKeyboardButton::callback("🏄‍♂️ Slippage | 95%", "none")],
+        vec![
+            InlineKeyboardButton::callback(format!("🏄‍♂️ Slippage | {}", st.sell_slippage), "edit_sell_slippage"),
+            InlineKeyboardButton::callback("🔄 Refresh PNL", "menu_swapsell"),
+        ],
         vec![InlineKeyboardButton::callback("<< Back", "menu_main")],
     ])
 }
@@ -264,7 +818,7 @@ fn make_autolimit_keyboard(st: &BotState) -> InlineKeyboardMarkup {
             InlineKeyboardButton::callback(format!("⚡ Tip | {} SOL", st.limit_tip_fee), "edit_auto_tip"),
             InlineKeyboardButton::callback(format!("⛽ P.Fee | {} SOL", st.limit_prio_fee), "edit_auto_prio"),
         ],
-        vec![InlineKeyboardButton::callback("🏄‍♂️ Slippage | 90%", "none")],
+        vec![InlineKeyboardButton::callback(format!("🏄‍♂️ Slippage | {}", st.sell_slippage), "edit_sell_slippage")],
         vec![
             InlineKeyboardButton::callback(format!("⏰ Act.Time | {}", st.limit_act_time), "edit_auto_acttime"),
             InlineKeyboardButton::callback("⌛ Order Expiry | 6d", "none"),
@@ -286,58 +840,176 @@ fn make_autolimit_keyboard(st: &BotState) -> InlineKeyboardMarkup {
 }
 
 fn make_limitbuy_keyboard(st: &BotState) -> InlineKeyboardMarkup {
-    InlineKeyboardMarkup::new(vec![
-        vec![
-            InlineKeyboardButton::callback(format!("⚡ Tip | {} SOL", st.buy_tip_fee), "edit_buy_tip"),
-            InlineKeyboardButton::callback(format!("⛽ P.Fee | {} SOL", st.buy_prio_fee), "edit_buy_prio"),
-        ],
-        vec![InlineKeyboardButton::callback("🏄‍♂️ Slippage | 90%", "none")],
-        vec![
-            InlineKeyboardButton::callback("Side | BUY", "none"),
-            InlineKeyboardButton::callback("Dip", "none"),
-        ],
-        vec![
-            InlineKeyboardButton::callback("Activation | Instant", "none"),
-            InlineKeyboardButton::callback(format!("💰 {:.2} $", st.buy_amount_usd), "edit_buy_amount"),
-        ],
-        vec![InlineKeyboardButton::callback(
-            format!("🎯 Target | {}", st.buy_target_mcap),
-            "edit_buy_mcap",
-        )],
-        vec![InlineKeyboardButton::callback("📥 Place Order 📥", "place_limit_buy")],
-        vec![InlineKeyboardButton::callback("<< Back", "menu_main")],
-    ])
-}
+    // ── Row preset Kecil/Sedang/Besar/Mega ──────────────────────────────────────
+    // Tampilkan 4 tombol preset, yang aktif diberi ✅
+    let preset_row: Vec<InlineKeyboardButton> = st.buy_presets.iter().enumerate().map(|(i, p)| {
+        let active = st.buy_active_preset == ActivePreset::Idx(i);
+        let label = if active {
+            format!("✅ {}", p.label)
+        } else {
+            p.label.clone()
+        };
+        InlineKeyboardButton::callback(label, format!("preset_select_{}", i))
+    }).collect();
 
-fn make_history_keyboard(orders: &[LimitOrder]) -> InlineKeyboardMarkup {
-    let mut rows = Vec::new();
-    if orders.is_empty() {
-        rows.push(vec![InlineKeyboardButton::callback("📭 Belum ada order", "none")]);
+    // ── Row edit nilai preset yang aktif (Tip & Prio-nya) ───────────────────────
+    let preset_edit_rows: Vec<Vec<InlineKeyboardButton>> = if let ActivePreset::Idx(idx) = &st.buy_active_preset {
+        let p = &st.buy_presets[*idx];
+        vec![vec![
+            InlineKeyboardButton::callback(
+                format!("✏️ {} Tip | {} SOL", p.label, p.tip),
+                format!("preset_edit_tip_{}", idx),
+            ),
+            InlineKeyboardButton::callback(
+                format!("✏️ {} Prio | {} SOL", p.label, p.prio),
+                format!("preset_edit_prio_{}", idx),
+            ),
+        ]]
     } else {
-        for o in orders.iter() {
-            let short = format!("{}...{}", &o.token[..4], &o.token[o.token.len()-4..]);
-            rows.push(vec![InlineKeyboardButton::callback(
-                format!("#{} | {} | {} | ${:.2}", o.id, short, o.target_mcap, o.amount_usd),
-                format!("order_view_{}", o.id),
-            )]);
-        }
-    }
+        vec![]
+    };
+
+    // ── Tip & Prio aktif (dari preset aktif atau manual) ────────────────────────
+    let tip_label = format!("⚡ Tip | {} SOL", st.buy_tip_fee);
+    let prio_label = format!("⛽ P.Fee | {} SOL", st.buy_prio_fee);
+
+    // ── Target price label ───────────────────────────────────────────────────────
+    let price_label = if st.buy_target_price.is_empty() {
+        "🎯 Target Price | (belum diset)".to_string()
+    } else {
+        format!("🎯 Target Price | {}", format_price_display(&st.buy_target_price))
+    };
+
+    let mut rows: Vec<Vec<InlineKeyboardButton>> = vec![
+        // Row 1: preset selector
+        preset_row,
+    ];
+    // Row edit nilai preset (hanya muncul kalau ada preset aktif)
+    rows.extend(preset_edit_rows);
+    // Row manual Tip & Prio
+    rows.push(vec![
+        InlineKeyboardButton::callback(tip_label, "edit_buy_tip"),
+        InlineKeyboardButton::callback(prio_label, "edit_buy_prio"),
+    ]);
+    // Row Slippage
+    rows.push(vec![InlineKeyboardButton::callback("🏄‍♂️ Slippage | 90%", "none")]);
+    // Row Side & Dip
+    rows.push(vec![
+        InlineKeyboardButton::callback("Side | BUY", "none"),
+        InlineKeyboardButton::callback("Dip", "none"),
+    ]);
+    // Row Activation & Amount
+    rows.push(vec![
+        InlineKeyboardButton::callback("Activation | Instant", "none"),
+        InlineKeyboardButton::callback(format!("💰 {:.2} $", st.buy_amount_usd), "edit_buy_amount"),
+    ]);
+    // Row Target Mcap
+    rows.push(vec![InlineKeyboardButton::callback(
+        format!("📊 Target Mcap | {}", st.buy_target_mcap),
+        "edit_buy_mcap",
+    )]);
+    // Row Target Price
+    rows.push(vec![InlineKeyboardButton::callback(price_label, "edit_buy_price")]);
+    // Row Place Order
+    rows.push(vec![InlineKeyboardButton::callback("📥 Place Order 📥", "place_limit_buy")]);
+    // Row Back
     rows.push(vec![InlineKeyboardButton::callback("<< Back", "menu_main")]);
+
     InlineKeyboardMarkup::new(rows)
 }
 
-fn make_order_detail_keyboard(o: &LimitOrder) -> InlineKeyboardMarkup {
+/// Format harga untuk tampilan singkat:
+/// 0.00000002 → 0.₇2 (angka 7 kecil superscript sebagai pengganti jumlah nol)
+fn format_price_display(price_str: &str) -> String {
+    let s = price_str.trim();
+    // Coba parse sebagai f64
+    if let Ok(val) = s.parse::<f64>() {
+        if val > 0.0 && val < 1.0 {
+            // Hitung jumlah angka nol setelah titik desimal sebelum angka signifikan pertama
+            let after_dot = s.trim_start_matches('-').splitn(2, '.').nth(1).unwrap_or("");
+            let leading_zeros = after_dot.chars().take_while(|&c| c == '0').count();
+            if leading_zeros >= 2 {
+                // Ambil angka signifikan setelah nol-nol
+                let sig = after_dot.trim_start_matches('0');
+                // Gunakan superscript digit untuk jumlah nol
+                let superscript = to_superscript(leading_zeros);
+                return format!("0.{}{}$", superscript, sig);
+            }
+        }
+        // Untuk harga biasa
+        return format!("{}$", s);
+    }
+    s.to_string()
+}
+
+/// Konversi angka ke superscript unicode (untuk notasi jumlah nol)
+fn to_superscript(n: usize) -> String {
+    let digits = ['⁰','¹','²','³','⁴','⁵','⁶','⁷','⁸','⁹'];
+    n.to_string().chars().map(|c| {
+        let d = c.to_digit(10).unwrap_or(0) as usize;
+        digits[d]
+    }).collect()
+}
+
+/// Parse harga dari input user.
+/// Mendukung 2 format:
+/// 1. Penuh: "0.00000002" → disimpan as-is
+/// 2. Singkat: "0.72" → "0." + angka pertama setelah titik sebagai jumlah nol + sisa angka
+///    Contoh: "0.72" → 7 nol, signifikan "2" → "0.00000002"
+/// Jika tidak bisa diparsing, return None.
+fn parse_compact_price(input: &str) -> Option<String> {
+    let s = input.trim().trim_end_matches('$').trim();
+    // Coba sebagai angka biasa dulu
+    if let Ok(val) = s.parse::<f64>() {
+        if val <= 0.0 { return None; }
+        if val >= 1.0 {
+            // Harga di atas 1 dollar, simpan as-is
+            return Some(format!("{}", val));
+        }
+        // val < 1.0
+        let after_dot = s.splitn(2, '.').nth(1).unwrap_or("");
+        let leading_zeros = after_dot.chars().take_while(|&c| c == '0').count();
+        
+        // Jika leading_zeros < 2, periksa apakah ini notasi singkat
+        // Notasi singkat: "0.72" → digit pertama = 7 (jumlah nol), digit berikutnya = 2 (signifikan)
+        if leading_zeros == 0 && after_dot.len() >= 2 {
+            // Cek: apakah digit pertama angka yang besar (≥2) menandakan jumlah nol?
+            let first_char = after_dot.chars().next()?;
+            let num_zeros = first_char.to_digit(10)? as usize;
+            if num_zeros >= 2 {
+                let sig_part = &after_dot[1..]; // angka setelah digit jumlah-nol
+                if !sig_part.is_empty() {
+                    let zeros = "0".repeat(num_zeros);
+                    return Some(format!("0.{}{}", zeros, sig_part));
+                }
+            }
+        }
+        // Format standar
+        return Some(s.to_string());
+    }
+    None
+}
+
+fn make_order_inline_keyboard(id: i64) -> InlineKeyboardMarkup {
     InlineKeyboardMarkup::new(vec![
         vec![
-            InlineKeyboardButton::callback(format!("⚡ Tip | {} SOL", o.tip_fee), format!("edit_hist_tip_{}", o.id)),
-            InlineKeyboardButton::callback(format!("⛽ P.Fee | {} SOL", o.prio_fee), format!("edit_hist_prio_{}", o.id)),
+            InlineKeyboardButton::callback("Kecil", format!("hist_preset_0_{}", id)),
+            InlineKeyboardButton::callback("Sedang", format!("hist_preset_1_{}", id)),
+            InlineKeyboardButton::callback("Besar", format!("hist_preset_2_{}", id)),
+            InlineKeyboardButton::callback("Mega", format!("hist_preset_3_{}", id)),
         ],
-        vec![InlineKeyboardButton::callback(format!("💰 Jumlah | {:.2} $", o.amount_usd), format!("edit_hist_amount_{}", o.id))],
-        vec![InlineKeyboardButton::callback(format!("🎯 Target | {}", o.target_mcap), format!("edit_hist_mcap_{}", o.id))],
-        vec![
-            InlineKeyboardButton::callback("🗑 Hapus Order", format!("delete_order_{}", o.id)),
-            InlineKeyboardButton::callback("<< Back", "menu_history"),
-        ],
+        vec![InlineKeyboardButton::callback("TARGET", format!("edit_hist_target_{}", id))],
+        vec![InlineKeyboardButton::callback("HAPUS", format!("delete_order_{}", id))],
+    ])
+}
+
+fn make_setup_keyboard(st: &BotState) -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![
+        vec![InlineKeyboardButton::callback(format!("Kecil (Tip: {}, Prio: {})", st.preset_kecil_tip, st.preset_kecil_prio), "setup_preset_0")],
+        vec![InlineKeyboardButton::callback(format!("Sedang (Tip: {}, Prio: {})", st.preset_sedang_tip, st.preset_sedang_prio), "setup_preset_1")],
+        vec![InlineKeyboardButton::callback(format!("Besar (Tip: {}, Prio: {})", st.preset_besar_tip, st.preset_besar_prio), "setup_preset_2")],
+        vec![InlineKeyboardButton::callback(format!("Mega (Tip: {}, Prio: {})", st.preset_mega_tip, st.preset_mega_prio), "setup_preset_3")],
+        vec![InlineKeyboardButton::callback("<< Back", "menu_main")],
     ])
 }
 
@@ -346,7 +1018,12 @@ fn make_order_detail_keyboard(o: &LimitOrder) -> InlineKeyboardMarkup {
 async fn send_limitbuy_menu(bot: &Bot, chat_id: ChatId, st: &BotState) -> ResponseResult<()> {
     if let Some(token) = &st.active_token {
         let short = format!("{}...{}", &token[..6], &token[token.len()-4..]);
-        let text = format!("🏦 **Token:** `{}`\n\n*Silakan klik tombol yang ingin diubah, lalu ketik nilainya.*", short);
+        let price_info = if !st.buy_target_price.is_empty() {
+            format!("\n💲 Target Price: `{}`", format_price_display(&st.buy_target_price))
+        } else {
+            String::new()
+        };
+        let text = format!("🏦 **Token:** `{}`{}\n\n*Silakan klik tombol yang ingin diubah, lalu ketik nilainya.*", short, price_info);
         bot.send_message(chat_id, text).reply_markup(make_limitbuy_keyboard(st)).await?;
     }
     Ok(())
@@ -354,10 +1031,21 @@ async fn send_limitbuy_menu(bot: &Bot, chat_id: ChatId, st: &BotState) -> Respon
 
 fn order_detail_text(o: &LimitOrder) -> String {
     let short = format!("{}...{}", &o.token[..6], &o.token[o.token.len()-4..]);
+    let price_line = if !o.target_price.is_empty() {
+        format!("\n💲 Target Price: {}", format_price_display(&o.target_price))
+    } else {
+        String::new()
+    };
     format!(
-        "📋 **Detail Order #{}**\n\nToken: `{}`\nFull: `{}`\n\n💰 Jumlah Beli: ${:.2}\n🎯 Target Mcap: {}\n⚡ Tip: {} SOL\n⛽ P.Fee: {} SOL\n🏄‍♂️ Slippage: 90%\n\n*Klik tombol yang ingin diedit, lalu balas dengan nominal barunya.*",
-        o.id, short, o.token, o.amount_usd, o.target_mcap, o.tip_fee, o.prio_fee
+        "📋 **Detail Order #{}**\n\nToken: `{}`\nFull: `{}`\n\n💰 Jumlah Beli: ${:.2}\n📊 Target Mcap: {}{}
+\n⚡ Tip: {} SOL\n⛽ P.Fee: {} SOL\n🏄‍♂️ Slippage: 90%\n\n*Klik tombol yang ingin diedit, lalu balas dengan nominal barunya.*",
+        o.id, short, o.token, o.amount_usd, o.target_mcap, price_line, o.tip_fee, o.prio_fee
     )
+}
+
+
+fn make_order_detail_keyboard(o: &LimitOrder) -> InlineKeyboardMarkup {
+    make_order_inline_keyboard(o.id as i64)
 }
 
 fn parse_number(text: &str) -> Option<f64> {
@@ -379,8 +1067,9 @@ async fn answer_command(
 ) -> ResponseResult<()> {
     match cmd {
         Command::Start => {
-            let st = state.lock().await;
+            let mut st = state.lock().await;
             st.limiter.until_ready().await;
+            st.active_chats.insert(msg.chat.id);
             let mode = if st.mode == AppMode::Mainnet { "MAINNET" } else { "SIMULASI" };
             bot.send_message(msg.chat.id, format!("👋 **Selamat datang!**\nMode: `{}`\n\nPilih menu atau **Paste Address Token** untuk Limit Buy.", mode))
                 .reply_markup(make_main_menu_keyboard()).await?;
@@ -399,6 +1088,18 @@ async fn answer_command(
                     vec![InlineKeyboardButton::callback("🔴 Confirm Swap Sell", "execute_swap_sell")],
                     vec![InlineKeyboardButton::callback("🔄 Refresh PNL", "refresh_pnl")],
                 ])).await?;
+        }
+        Command::Clear => {
+            // Hapus tombol-tombol yang tidak terpakai dari state jika ada
+            {
+                let mut st = state.lock().await;
+                st.swap_panel_msgs.clear();
+            }
+            bot.send_message(msg.chat.id, "🧹 Layar dibersihkan.\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n✅ Selesai.").await?;
+        }
+        Command::Panel => {
+            let st = state.lock().await;
+            send_limitbuy_menu(&bot, msg.chat.id, &st).await?;
         }
     }
     Ok(())
@@ -455,6 +1156,65 @@ async fn handle_text_message(
                     st.edit_field = EditField::None;
                     send_limitbuy_menu(&bot, chat_id, &st).await?;
                 }
+            }
+            EditField::BuyTargetPrice => {
+                // Mendukung notasi singkat "0.72" (7 nol → 0.00000002) atau penuh
+                let raw = text_trim.trim_end_matches('$').trim();
+                if let Some(parsed) = parse_compact_price(raw) {
+                    st.buy_target_price = parsed;
+                    st.edit_field = EditField::None;
+                    send_limitbuy_menu(&bot, chat_id, &st).await?;
+                } else {
+                    bot.send_message(chat_id, "❌ Format harga tidak valid. Contoh: `0.00000002` atau singkat `0.72`").await?;
+                }
+            }
+            EditField::BuyPresetTip(idx) => {
+                if let Some(val) = parse_number(&lower) {
+                    if idx < st.buy_presets.len() {
+                        st.buy_presets[idx].tip = val;
+                        // Jika preset ini aktif, apply ke buy_tip_fee juga
+                        if st.buy_active_preset == ActivePreset::Idx(idx) {
+                            st.buy_tip_fee = val;
+                        }
+                    }
+                    st.edit_field = EditField::None;
+                    send_limitbuy_menu(&bot, chat_id, &st).await?;
+                }
+            }
+            EditField::BuyPresetPrio(idx) => {
+                if let Some(val) = parse_number(&lower) {
+                    if idx < st.buy_presets.len() {
+                        st.buy_presets[idx].prio = val;
+                        // Jika preset ini aktif, apply ke buy_prio_fee juga
+                        if st.buy_active_preset == ActivePreset::Idx(idx) {
+                            st.buy_prio_fee = val;
+                        }
+                    }
+                    st.edit_field = EditField::None;
+                    send_limitbuy_menu(&bot, chat_id, &st).await?;
+                }
+            }
+            EditField::SellTip => {
+                if let Some(val) = parse_number(&lower) {
+                    st.sell_tip_fee = val;
+                    st.edit_field = EditField::None;
+                    bot.send_message(chat_id, format!("Tip Swap Sell diubah ke {} SOL", val))
+                        .reply_markup(make_swapsell_keyboard(&st)).await?;
+                }
+            }
+            EditField::SellPrio => {
+                if let Some(val) = parse_number(&lower) {
+                    st.sell_prio_fee = val;
+                    st.edit_field = EditField::None;
+                    bot.send_message(chat_id, format!("P.Fee Swap Sell diubah ke {} SOL", val))
+                        .reply_markup(make_swapsell_keyboard(&st)).await?;
+                }
+            }
+            EditField::SellSlippage => {
+                st.sell_slippage = text_trim.to_string();
+                st.edit_field = EditField::None;
+                bot.send_message(chat_id, format!("Slippage Swap Sell diubah ke {}", st.sell_slippage))
+                    .reply_markup(make_swapsell_keyboard(&st)).await?;
             }
             EditField::AutoTip => {
                 if let Some(val) = parse_number(&lower) {
@@ -518,6 +1278,51 @@ async fn handle_text_message(
                     }
                 }
             }
+            EditField::HistTarget(id) => {
+                let update_result = if let Ok(conn) = st.db_conn.try_lock() {
+                    let orders = db::load_limit_orders(&conn).unwrap_or_default();
+                    if let Some(o) = orders.iter().find(|o| o.id == id) {
+                        let _ = db::update_limit_order(&conn, id, text_trim, o.tip_fee, o.prio_fee);
+                        Some(format!(
+                            "#{} LIMIT ORDER | {}\nToken: `{}`\nTarget: {}\n⚡ Tip: {} SOL | ⛽ Prio: {} SOL",
+                            o.id, o.order_type, o.token, text_trim, o.tip_fee, o.prio_fee
+                        ))
+                    } else { None }
+                } else { None };
+                st.edit_field = EditField::None;
+                if let Some(txt) = update_result {
+                    bot.send_message(chat_id, txt).reply_markup(make_order_inline_keyboard(id)).await?;
+                }
+            }
+            EditField::SetupPresetTip(idx) => {
+                if let Some(val) = parse_number(&lower) {
+                    match idx {
+                        0 => st.preset_kecil_tip = val,
+                        1 => st.preset_sedang_tip = val,
+                        2 => st.preset_besar_tip = val,
+                        _ => st.preset_mega_tip = val,
+                    }
+                    st.edit_field = EditField::SetupPresetPrio(idx);
+                    let label = match idx { 0 => "Kecil", 1 => "Sedang", 2 => "Besar", _ => "Mega" };
+                    bot.send_message(chat_id, format!("✅ Tip disimpan! Sekarang ketik *Priority Fee* untuk preset **{}** (contoh: `0.002`)", label)).await?;
+                }
+            }
+            EditField::SetupPresetPrio(idx) => {
+                if let Some(val) = parse_number(&lower) {
+                    match idx {
+                        0 => st.preset_kecil_prio = val,
+                        1 => st.preset_sedang_prio = val,
+                        2 => st.preset_besar_prio = val,
+                        _ => st.preset_mega_prio = val,
+                    }
+                    st.sync_presets();
+                    st.save_db();
+                    st.edit_field = EditField::None;
+                    let label = match idx { 0 => "Kecil", 1 => "Sedang", 2 => "Besar", _ => "Mega" };
+                    bot.send_message(chat_id, format!("✅ Preset **{}** berhasil diperbarui!", label))
+                        .reply_markup(make_setup_keyboard(&st)).await?;
+                }
+            }
             EditField::None => {
                 // Ignore text if we are not editing anything, 
                 // UN Kecuali fallback global kalau user ngetik "5$" tanpa nge-klik tombol edit Amount dulu (untuk UX lama)
@@ -537,7 +1342,12 @@ async fn handle_text_message(
                     }
                 }
             }
+            _ => {
+                // handle other edit fields
+                st.edit_field = EditField::None;
+            }
         }
+        st.save_db();
     }
     Ok(())
 }
@@ -557,49 +1367,100 @@ async fn handle_callback(
         st.active_chats.insert(chat_id);
 
         // Prefix routing for history order view & delete
-        if data.starts_with("order_view_") {
-            let id: usize = data.trim_start_matches("order_view_").parse().unwrap_or(0);
-            if let Some(o) = st.orders.iter().find(|o| o.id == id).cloned() {
-                bot.edit_message_text(chat_id, msg_id, order_detail_text(&o)).reply_markup(make_order_detail_keyboard(&o)).await?;
-            }
-            bot.answer_callback_query(q.id).await?;
-            return Ok(());
-        }
         if data.starts_with("delete_order_") {
-            let id: usize = data.trim_start_matches("delete_order_").parse().unwrap_or(0);
-            st.orders.retain(|o| o.id != id);
-            bot.edit_message_text(chat_id, msg_id, "Order dihapus.").reply_markup(make_history_keyboard(&st.orders)).await?;
-            bot.answer_callback_query(q.id).await?;
+            let id: i64 = data.trim_start_matches("delete_order_").parse().unwrap_or(0);
+            if let Ok(conn) = st.db_conn.try_lock() {
+                let _ = db::delete_limit_order(&conn, id);
+            }
+            bot.edit_message_text(chat_id, msg_id, "Order dihapus.").await?;
+            bot.answer_callback_query(q.id.clone()).await?;
             return Ok(());
         }
 
-        // Prefix routing for history edit fields
-        if data.starts_with("edit_hist_amount_") {
-            let id: usize = data.trim_start_matches("edit_hist_amount_").parse().unwrap_or(0);
-            st.edit_field = EditField::HistAmount(id);
-            bot.answer_callback_query(q.id).text("Ketik jumlah baru!").await?;
-            bot.send_message(chat_id, "✏️ Ketik jumlah baru (misal: 5)").await?;
+        if data.starts_with("hist_preset_") {
+            // hist_preset_0_123
+            let parts: Vec<&str> = data.split('_').collect();
+            if parts.len() == 4 {
+                let preset_idx: usize = parts[2].parse().unwrap_or(0);
+                let order_id: i64 = parts[3].parse().unwrap_or(0);
+                let (tip, prio) = match preset_idx {
+                    0 => (st.preset_kecil_tip, st.preset_kecil_prio),
+                    1 => (st.preset_sedang_tip, st.preset_sedang_prio),
+                    2 => (st.preset_besar_tip, st.preset_besar_prio),
+                    _ => (st.preset_mega_tip, st.preset_mega_prio),
+                };
+                if let Ok(conn) = st.db_conn.try_lock() {
+                    let orders = db::load_limit_orders(&conn).unwrap_or_default();
+                    if let Some(o) = orders.iter().find(|o| o.id == order_id) {
+                        let _ = db::update_limit_order(&conn, order_id, &o.target, tip, prio);
+                        bot.answer_callback_query(q.id.clone()).text("Preset diaplikasikan!").await?;
+                        // update msg
+                        let text = format!(
+                            "#{} LIMIT ORDER | {}\nToken: `{}`\nTarget: {}\n(Tip: {} SOL, Prio: {} SOL)",
+                            o.id, o.order_type, o.token, o.target, tip, prio
+                        );
+                        bot.edit_message_text(chat_id, msg_id, text).reply_markup(make_order_inline_keyboard(o.id)).await?;
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        
+        if data.starts_with("edit_hist_target_") {
+            let id: i64 = data.trim_start_matches("edit_hist_target_").parse().unwrap_or(0);
+            st.edit_field = EditField::HistTarget(id);
+            bot.answer_callback_query(q.id.clone()).text("Ketik target baru!").await?;
+            bot.send_message(chat_id, "✏️ Ketik target baru").await?;
             return Ok(());
         }
-        if data.starts_with("edit_hist_mcap_") {
-            let id: usize = data.trim_start_matches("edit_hist_mcap_").parse().unwrap_or(0);
-            st.edit_field = EditField::HistMcap(id);
-            bot.answer_callback_query(q.id).text("Ketik target baru!").await?;
-            bot.send_message(chat_id, "✏️ Ketik target baru (misal: 100 mcap)").await?;
+
+        // ── Prefix routing untuk Quick-set Preset ────────────────────────────────
+        // preset_select_<idx>: user memilih preset, apply ke buy_tip_fee & buy_prio_fee
+        if data.starts_with("preset_select_") {
+            let idx: usize = data.trim_start_matches("preset_select_").parse().unwrap_or(0);
+            if idx < st.buy_presets.len() {
+                // Toggle: jika sudah aktif, deaktifkan; jika belum, aktifkan
+                if st.buy_active_preset == ActivePreset::Idx(idx) {
+                    let label = st.buy_presets[idx].label.clone();
+                    st.buy_active_preset = ActivePreset::None;
+                    bot.answer_callback_query(q.id.clone()).text(format!("Preset {} dinonaktifkan", label)).await?;
+                } else {
+                    // Clone nilai dulu sebelum mutable borrow
+                    let (tip, prio, label) = {
+                        let p = &st.buy_presets[idx];
+                        (p.tip, p.prio, p.label.clone())
+                    };
+                    st.buy_tip_fee = tip;
+                    st.buy_prio_fee = prio;
+                    st.buy_active_preset = ActivePreset::Idx(idx);
+                    bot.answer_callback_query(q.id.clone()).text(format!("✅ Preset {} aktif! Tip={} Prio={}", label, tip, prio)).await?;
+                }
+                // Refresh keyboard
+                let keyboard = make_limitbuy_keyboard(&st);
+                let _ = bot.edit_message_reply_markup(chat_id, msg_id).reply_markup(keyboard).await;
+            }
             return Ok(());
         }
-        if data.starts_with("edit_hist_tip_") {
-            let id: usize = data.trim_start_matches("edit_hist_tip_").parse().unwrap_or(0);
-            st.edit_field = EditField::HistTip(id);
-            bot.answer_callback_query(q.id).text("Ketik Tip baru!").await?;
-            bot.send_message(chat_id, "✏️ Ketik Tip baru (misal: 0.005)").await?;
+        // preset_edit_tip_<idx>: edit nilai tip preset tertentu
+        if data.starts_with("preset_edit_tip_") {
+            let idx: usize = data.trim_start_matches("preset_edit_tip_").parse().unwrap_or(0);
+            if idx < st.buy_presets.len() {
+                let label = st.buy_presets[idx].label.clone();
+                st.edit_field = EditField::BuyPresetTip(idx);
+                bot.answer_callback_query(q.id.clone()).text(format!("Ketik Tip baru untuk preset {}", label)).await?;
+                bot.send_message(chat_id, format!("✏️ Ketik nilai Tip untuk preset **{}** (contoh: 0.005)", label)).await?;
+            }
             return Ok(());
         }
-        if data.starts_with("edit_hist_prio_") {
-            let id: usize = data.trim_start_matches("edit_hist_prio_").parse().unwrap_or(0);
-            st.edit_field = EditField::HistPrio(id);
-            bot.answer_callback_query(q.id).text("Ketik P.Fee baru!").await?;
-            bot.send_message(chat_id, "✏️ Ketik P.Fee baru (misal: 0.005)").await?;
+        // preset_edit_prio_<idx>: edit nilai prio preset tertentu
+        if data.starts_with("preset_edit_prio_") {
+            let idx: usize = data.trim_start_matches("preset_edit_prio_").parse().unwrap_or(0);
+            if idx < st.buy_presets.len() {
+                let label = st.buy_presets[idx].label.clone();
+                st.edit_field = EditField::BuyPresetPrio(idx);
+                bot.answer_callback_query(q.id.clone()).text(format!("Ketik Prio baru untuk preset {}", label)).await?;
+                bot.send_message(chat_id, format!("✏️ Ketik nilai P.Fee untuk preset **{}** (contoh: 0.005)", label)).await?;
+            }
             return Ok(());
         }
 
@@ -607,95 +1468,368 @@ async fn handle_callback(
         match data.as_str() {
             "menu_main" => {
                 bot.edit_message_text(chat_id, msg_id, "👋 **Menu Utama**").reply_markup(make_main_menu_keyboard()).await?;
-                bot.answer_callback_query(q.id).await?;
+                bot.answer_callback_query(q.id.clone()).await?;
             }
             "menu_swapsell" => {
-                bot.edit_message_text(chat_id, msg_id, "⚙️ **Swap Sell (Terkunci)**").reply_markup(make_swapsell_keyboard()).await?;
-                bot.answer_callback_query(q.id).await?;
+                let token = st.active_token.clone().unwrap_or_else(|| "Tidak ada token".to_string());
+                let bot_clone = bot.clone();
+                let client_opt = st.aura_client.clone();
+                let _q_id = q.id.clone();
+                let keyboard = make_swapsell_keyboard(&st);
+                tokio::spawn(async move {
+                    let mut pnl_text = format!("Token: `{}`\nPNL: 0.00%\nAmount SOL: 0", token);
+                    if token != "Tidak ada token" {
+                        if let Some(client) = client_opt {
+                            let req = tonic::Request::new(aura_api_client::types::TokenPositionsUiReq { mint: None });
+                            if let Ok(resp) = client.aura().get_token_positions_ui((), req).await {
+                                let ui = resp.into_inner();
+                                for pos in ui.positions {
+                                    let mint_str = format!("{:?}", pos.mint);
+                                    if mint_str.contains(&token) {
+                                        let pnl_str = if let Some(p) = pos.pnl {
+                                            format!("{:.2}", p)
+                                        } else {
+                                            "0.00".to_string()
+                                        };
+                                        let amount_sol = format!("{}", pos.quote_value);
+                                        pnl_text = format!("Token: `{}`\nPNL: {}%\nAmount SOL: {}", token, pnl_str, amount_sol);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let _ = bot_clone.edit_message_text(chat_id, msg_id, pnl_text)
+                        .reply_markup(keyboard)
+                        .await;
+                });
+                bot.answer_callback_query(q.id.clone()).text("Memuat data token...").await?;
+            }
+            "refresh_pnl" => {
+                let token = st.active_token.clone().unwrap_or_else(|| "Tidak ada token".to_string());
+                let bot_clone = bot.clone();
+                let client_opt = st.aura_client.clone();
+                let _q_id = q.id.clone();
+                // Gunakan keyboard panel saja, jangan setting
+                let panel_keyboard = teloxide::types::InlineKeyboardMarkup::new(vec![
+                    vec![teloxide::types::InlineKeyboardButton::callback(
+                        "🔴 Confirm Swap Sell", "execute_swap_sell",
+                    )],
+                    vec![teloxide::types::InlineKeyboardButton::callback(
+                        "🔄 Refresh PNL", "refresh_pnl",
+                    )],
+                ]);
+                tokio::spawn(async move {
+                    let mut pnl_text = format!("Token: `{}`\nPNL: 0.00%\nAmount SOL: 0", token);
+                    if token != "Tidak ada token" {
+                        if let Some(client) = client_opt {
+                            let req = tonic::Request::new(aura_api_client::types::TokenPositionsUiReq { mint: None });
+                            if let Ok(resp) = client.aura().get_token_positions_ui((), req).await {
+                                let ui = resp.into_inner();
+                                for pos in ui.positions {
+                                    let mint_str = format!("{:?}", pos.mint);
+                                    if mint_str.contains(&token) {
+                                        let pnl_str = if let Some(p) = pos.pnl {
+                                            format!("{:.2}", p)
+                                        } else {
+                                            "0.00".to_string()
+                                        };
+                                        let amount_sol = format!("{}", pos.quote_value);
+                                        pnl_text = format!("Token: `{}`\nPNL: {}%\nAmount SOL: {}", token, pnl_str, amount_sol);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let _ = bot_clone.edit_message_text(chat_id, msg_id, pnl_text)
+                        .reply_markup(panel_keyboard)
+                        .await;
+                });
+                bot.answer_callback_query(q.id.clone()).text("Memuat data token...").await?;
             }
             "menu_autolimit" => {
                 bot.edit_message_text(chat_id, msg_id, "⚙️ **Auto Limit Sell**\nKlik tombol lalu ketik nilainya.").reply_markup(make_autolimit_keyboard(&st)).await?;
-                bot.answer_callback_query(q.id).await?;
+                bot.answer_callback_query(q.id.clone()).await?;
             }
             "menu_history" => {
-                bot.edit_message_text(chat_id, msg_id, "📋 **History Order**").reply_markup(make_history_keyboard(&st.orders)).await?;
-                bot.answer_callback_query(q.id).await?;
+                drop(st); // release lock before await
+                let st2 = state.lock().await;
+                bot.answer_callback_query(q.id.clone()).await?;
+                bot.send_message(chat_id, "📋 *Limit Order History*").await?;
+                send_history_orders(&bot, chat_id, &st2).await?;
+                return Ok(());
+            }
+            "menu_lo_setup" => {
+                bot.send_message(chat_id, "⚙️ *Limit Order Setup*\n\nTap salah satu preset untuk mengatur Tip & Priority Fee.\nNilai ini digunakan saat Anda memilih preset di history order.")
+                    .reply_markup(make_setup_keyboard(&st)).await?;
+                bot.answer_callback_query(q.id.clone()).await?;
+            }
+            "menu_lo_logs" => {
+                drop(st);
+                let st2 = state.lock().await;
+                bot.answer_callback_query(q.id.clone()).await?;
+                send_error_logs(&bot, chat_id, &st2).await?;
+                return Ok(());
+            }
+            "clear_error_logs" => {
+                if let Ok(conn) = st.db_conn.try_lock() {
+                    let _ = db::clear_error_logs(&conn);
+                }
+                bot.edit_message_text(chat_id, msg_id, "✅ Semua log error telah dihapus.").await?;
+                bot.answer_callback_query(q.id.clone()).await?;
             }
             "toggle_autolimit" => {
                 st.auto_limit_active = !st.auto_limit_active;
+                st.save_db();
                 bot.edit_message_reply_markup(chat_id, msg_id).reply_markup(make_autolimit_keyboard(&st)).await?;
-                bot.answer_callback_query(q.id).await?;
+                bot.answer_callback_query(q.id.clone()).await?;
+            }
+            // Limit Order Setup preset handlers
+            "setup_preset_0" | "setup_preset_1" | "setup_preset_2" | "setup_preset_3" => {
+                let idx: usize = data.trim_start_matches("setup_preset_").parse().unwrap_or(0);
+                let label = match idx { 0 => "Kecil", 1 => "Sedang", 2 => "Besar", _ => "Mega" };
+                st.edit_field = EditField::SetupPresetTip(idx);
+                bot.answer_callback_query(q.id.clone()).text(format!("Edit {} Tip & Prio", label)).await?;
+                bot.send_message(chat_id, format!("✏️ Ketik *Tip* untuk preset **{}** (contoh: `0.002`)", label))
+                    .await?;
+            }
+            // Auto Limit Edits
+            "edit_sell_tip" => {
+                st.edit_field = EditField::SellTip;
+                bot.answer_callback_query(q.id.clone()).text("Menunggu input tip...").await?;
+                bot.send_message(chat_id, "✏️ Ketik nilai Tip Swap Sell (contoh: 0.005)").await?;
+            }
+            "edit_sell_prio" => {
+                st.edit_field = EditField::SellPrio;
+                bot.answer_callback_query(q.id.clone()).text("Menunggu input p.fee...").await?;
+                bot.send_message(chat_id, "✏️ Ketik nilai P.Fee Swap Sell (contoh: 0.005)").await?;
+            }
+            "edit_sell_slippage" => {
+                st.edit_field = EditField::SellSlippage;
+                bot.answer_callback_query(q.id.clone()).text("Menunggu input slippage...").await?;
+                bot.send_message(chat_id, "✏️ Ketik nilai Slippage Swap Sell (contoh: 95%)").await?;
             }
             // Auto Limit Edits
             "edit_auto_tip" => {
                 st.edit_field = EditField::AutoTip;
-                bot.answer_callback_query(q.id).text("Menunggu input tip...").await?;
+                bot.answer_callback_query(q.id.clone()).text("Menunggu input tip...").await?;
                 bot.send_message(chat_id, "✏️ Ketik nilai Tip baru (contoh: 0.005)").await?;
             }
             "edit_auto_prio" => {
                 st.edit_field = EditField::AutoPrio;
-                bot.answer_callback_query(q.id).text("Menunggu input p.fee...").await?;
+                bot.answer_callback_query(q.id.clone()).text("Menunggu input p.fee...").await?;
                 bot.send_message(chat_id, "✏️ Ketik nilai P.Fee baru (contoh: 0.005)").await?;
             }
             "edit_auto_acttime" => {
                 st.edit_field = EditField::AutoActTime;
-                bot.answer_callback_query(q.id).text("Menunggu input act.time...").await?;
+                bot.answer_callback_query(q.id.clone()).text("Menunggu input act.time...").await?;
                 bot.send_message(chat_id, "✏️ Ketik nilai Act.Time baru (contoh: 5s, 10s)").await?;
             }
             "edit_auto_pnl" => {
                 st.edit_field = EditField::AutoPnl;
-                bot.answer_callback_query(q.id).text("Menunggu input target PNL...").await?;
+                bot.answer_callback_query(q.id.clone()).text("Menunggu input target PNL...").await?;
                 bot.send_message(chat_id, "✏️ Ketik Target PNL baru (contoh: 100%)").await?;
             }
             // Buy Limit Edits
             "edit_buy_amount" => {
                 st.edit_field = EditField::BuyAmount;
-                bot.answer_callback_query(q.id).text("Menunggu input jumlah...").await?;
+                bot.answer_callback_query(q.id.clone()).text("Menunggu input jumlah...").await?;
                 bot.send_message(chat_id, "✏️ Ketik jumlah USD beli baru (contoh: 5)").await?;
             }
             "edit_buy_mcap" => {
                 st.edit_field = EditField::BuyMcap;
-                bot.answer_callback_query(q.id).text("Menunggu input target...").await?;
+                bot.answer_callback_query(q.id.clone()).text("Menunggu input target...").await?;
                 bot.send_message(chat_id, "✏️ Ketik target Mcap baru (contoh: 100 mcap)").await?;
+            }
+            "edit_buy_price" => {
+                st.edit_field = EditField::BuyTargetPrice;
+                bot.answer_callback_query(q.id.clone()).text("Ketik harga target...").await?;
+                bot.send_message(chat_id,
+                    "✏️ Ketik harga target limit buy.\n\
+                    \n\
+                    Format:\n\
+                    • Lengkap: `0.00000002`\n\
+                    • Singkat: `0.72` artinya 0.0000007 dengan 7 nol = 0.⁷2\n\
+                    \n\
+                    Bot akan otomatis memformat tampilan.").await?;
             }
             "edit_buy_tip" => {
                 st.edit_field = EditField::BuyTip;
-                bot.answer_callback_query(q.id).text("Menunggu input tip...").await?;
+                bot.answer_callback_query(q.id.clone()).text("Menunggu input tip...").await?;
                 bot.send_message(chat_id, "✏️ Ketik nilai Tip baru (contoh: 0.005)").await?;
             }
             "edit_buy_prio" => {
                 st.edit_field = EditField::BuyPrio;
-                bot.answer_callback_query(q.id).text("Menunggu input p.fee...").await?;
+                bot.answer_callback_query(q.id.clone()).text("Menunggu input p.fee...").await?;
                 bot.send_message(chat_id, "✏️ Ketik nilai P.Fee baru (contoh: 0.005)").await?;
             }
             "place_limit_buy" => {
                 if let Some(token) = &st.active_token {
+                    let target = if !st.buy_target_price.is_empty() {
+                        st.buy_target_price.clone()
+                    } else {
+                        st.buy_target_mcap.clone()
+                    };
                     let o = LimitOrder {
                         id: st.next_order_id,
                         token: token.clone(),
                         amount_usd: st.buy_amount_usd,
                         target_mcap: st.buy_target_mcap.clone(),
+                        target_price: st.buy_target_price.clone(),
                         tip_fee: st.buy_tip_fee,
                         prio_fee: st.buy_prio_fee,
                     };
+                    // Save to SQLite
+                    if let Ok(conn) = st.db_conn.try_lock() {
+                        let _ = db::insert_limit_order(&conn, "BUY", token, &target, st.buy_tip_fee, st.buy_prio_fee);
+                    }
                     st.orders.push(o);
                     st.next_order_id += 1;
-                    bot.answer_callback_query(q.id).text("Order disimpan!").await?;
-                    bot.send_message(chat_id, "🟢 Limit Buy Order disimpan. Cek Limit Order History.").await?;
+                    bot.answer_callback_query(q.id.clone()).text("Order disimpan!").await?;
+                    bot.send_message(chat_id, "🟢 Limit Buy Order disimpan ke History.\n\n📋 Buka *Limit Order History* untuk melihat.").await?;
                 }
             }
             "execute_swap_sell" => {
-                bot.send_message(chat_id, "🟢 Swap Sell Dieksekusi!").await?;
-                bot.answer_callback_query(q.id).await?;
+                if let Some(client) = st.aura_client.clone() {
+                    if let Some(token) = st.active_token.clone() {
+                        let bot_clone = bot.clone();
+                        let tip_fee = st.sell_tip_fee;
+                        let prio_fee = st.sell_prio_fee;
+                        let slippage_str = st.sell_slippage.clone();
+                        let chat_id_clone = chat_id;
+                        // Ambil daftar panel yg perlu diedit setelah sell berhasil
+                        let panel_msgs = st.swap_panel_msgs.clone();
+                        st.swap_panel_msgs.clear(); // clear dulu agar tidak diedit ulang
+                        
+                        tokio::spawn(async move {
+                            use aura_api_client::types::{MarketTrade, SwapAmount, UserNonceStrategy, ApiOrders, TradeFilters};
+                            use std::str::FromStr;
+                            
+                            let _ = bot_clone.send_message(chat_id_clone, "⏳ Memproses Swap Sell Manual 100% ke Aura...").await;
+                            
+                            if let Ok(mint_addr) = solana_address::Address::from_str(&token) {
+                                let tip_lamports = (tip_fee * 1e9) as u64;
+                                let prio_lamports = (prio_fee * 1e9) as u64;
+                                
+                                let slippage_f64 = slippage_str.replace("%", "").trim().parse::<f64>().unwrap_or(15.0);
+                                let slippage_scaled = (slippage_f64 / 100.0 * 1_000_000.0) as u64;
+                                let slippage_val = fastnum::UD128::from(slippage_scaled) / fastnum::UD128::from(1_000_000u64);
+                                
+                                let req = tonic::Request::new(MarketTrade {
+                                    wallet: None,
+                                    amount: SwapAmount::SellPerc { amount: fastnum::udec128!(1) },
+                                    mint: mint_addr,
+                                    slippage: slippage_val,
+                                    tip: decisol::Lamports::from(tip_lamports),
+                                    priority_fee: decisol::Lamports::from(prio_lamports),
+                                    procs: None,
+                                    nonce: UserNonceStrategy::Hybrid,
+                                    slot_latency: None,
+                                    expire_at: None,
+                                    rpc_nonce: None,
+                                    max_price_impact: None,
+                                    limit_orders: ApiOrders { orders: vec![] },
+                                    filters: TradeFilters { min_mcap: None, max_mcap: None },
+                                });
+
+                                match client.aura().trade((), req).await {
+                                    Ok(_resp) => {
+                                        let short = if token.len() >= 10 {
+                                            format!("{}...{}", &token[..6], &token[token.len()-4..])
+                                        } else {
+                                            token.clone()
+                                        };
+                                        let sold_text = format!(
+                                            "✅ *Terjual via Swap Sell Manual!*\n\n\
+                                            🏦 Token: `{}`\n\
+                                            💰 100% posisi dijual ke pasar\n\
+                                            ⚡ Tip: {} SOL\n\
+                                            ⛽ P.Fee: {} SOL\n\n\
+                                            _Transaksi dikirim ke Aura gRPC._",
+                                            short, tip_fee, prio_fee
+                                        );
+                                        // Edit panel asli jika ada
+                                        if panel_msgs.is_empty() {
+                                            let _ = bot_clone.send_message(chat_id_clone, &sold_text).await;
+                                        } else {
+                                            for (c, m) in &panel_msgs {
+                                                let _ = bot_clone.edit_message_text(*c, *m, &sold_text).await;
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        let _ = bot_clone.send_message(chat_id_clone, format!("❌ Swap Sell Manual Gagal: {}", e.message())).await;
+                                    }
+                                }
+                            } else {
+                                let _ = bot_clone.send_message(chat_id_clone, "❌ Alamat token tidak valid!").await;
+                            }
+                        });
+                    } else {
+                        bot.send_message(chat_id, "❌ Tidak ada token aktif yang terdeteksi untuk dijual.").await?;
+                    }
+                } else {
+                    bot.send_message(chat_id, "❌ Koneksi ke Aura gRPC tidak tersedia.").await?;
+                }
+                bot.answer_callback_query(q.id.clone()).await?;
             }
-            "refresh_pnl" => {
-                bot.answer_callback_query(q.id).text("PNL Refresh.").await?;
-            }
+
             "none" => {
-                bot.answer_callback_query(q.id).text("Terkunci (Fixed Setting).").await?;
+                bot.answer_callback_query(q.id.clone()).text("Terkunci (Fixed Setting).").await?;
             }
             _ => {}
         }
+    }
+    Ok(())
+}
+
+async fn send_history_orders(bot: &Bot, chat_id: ChatId, st: &BotState) -> ResponseResult<()> {
+    if let Ok(conn) = st.db_conn.try_lock() {
+        let orders = db::load_limit_orders(&conn).unwrap_or_default();
+        if orders.is_empty() {
+            bot.send_message(chat_id, "📭 Belum ada limit order yang aktif.").await?;
+        } else {
+            for o in orders {
+                let text = format!(
+                    "#{} LIMIT ORDER | {}\nToken: `{}`\nTarget: {}\n⚡ Tip: {} SOL | ⛽ Prio: {} SOL",
+                    o.id, o.order_type, o.token, o.target, o.tip_fee, o.prio_fee
+                );
+                bot.send_message(chat_id, text)
+                    .reply_markup(make_order_inline_keyboard(o.id))
+                    .await?;
+            }
+        }
+    } else {
+        bot.send_message(chat_id, "❌ Database sedang sibuk, coba lagi.").await?;
+    }
+    Ok(())
+}
+
+async fn send_error_logs(bot: &Bot, chat_id: ChatId, st: &BotState) -> ResponseResult<()> {
+    if let Ok(conn) = st.db_conn.try_lock() {
+        let logs = db::load_error_logs(&conn).unwrap_or_default();
+        if logs.is_empty() {
+            bot.send_message(chat_id, "📜 Tidak ada log error saat ini.\n\n_Semua transaksi limit order berjalan normal, atau belum ada limit order yang dieksekusi._").await?;
+        } else {
+            let mut text = String::from("📜 *Error Logs Limit Order*\n\n");
+            for l in logs.iter().take(10) {
+                text.push_str(&format!(
+                    "`[{}]`\nOrder #{} | Token: `{}`\nError: _{}_\n\n",
+                    l.created_at, l.order_id, l.token, l.error_msg
+                ));
+            }
+            if logs.len() > 10 {
+                text.push_str(&format!("_(+ {} log lainnya — klik hapus untuk bersihkan semua)_", logs.len() - 10));
+            }
+            let kb = InlineKeyboardMarkup::new(vec![
+                vec![InlineKeyboardButton::callback("🗑 Hapus Semua Log", "clear_error_logs")],
+                vec![InlineKeyboardButton::callback("<< Back", "menu_main")],
+            ]);
+            bot.send_message(chat_id, text).reply_markup(kb).await?;
+        }
+    } else {
+        bot.send_message(chat_id, "❌ Database sedang sibuk, coba lagi.").await?;
     }
     Ok(())
 }
