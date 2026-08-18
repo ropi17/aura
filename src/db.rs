@@ -29,8 +29,8 @@ impl Default for DbSettings {
     fn default() -> Self {
         Self {
             auto_limit_active: false,
-            limit_tip_fee: 0.0015,
-            limit_prio_fee: 0.0015,
+            limit_tip_fee: 0.0025,
+            limit_prio_fee: 0.002,
             limit_act_time: "0s".to_string(),
             limit_target_pnl: "50%".to_string(),
             sell_tip_fee: 0.0015,
@@ -51,6 +51,7 @@ impl Default for DbSettings {
 // ─── Limit Order History (persistent) ─────────────────────────────────────────
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct DbLimitOrder {
     pub id: i64,
     pub order_type: String, // "BUY" or "SELL"
@@ -64,6 +65,7 @@ pub struct DbLimitOrder {
 // ─── Error Logs ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct DbErrorLog {
     pub id: i64,
     pub order_id: i64,

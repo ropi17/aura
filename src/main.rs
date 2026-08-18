@@ -60,8 +60,7 @@ struct LimitOrder {
     id: usize,
     token: String,
     amount_usd: f64,
-    target_mcap: String,
-    target_price: String,
+    target: String,       // unified target: mcap / price-usd / persen-change
     tip_fee: f64,
     prio_fee: f64,
 }
@@ -88,14 +87,14 @@ enum ActivePreset {
 }
 
 #[derive(Clone, PartialEq)]
+#[allow(dead_code)]
 enum EditField {
     None,
     // Limit Buy (Baru)
     BuyAmount,
-    BuyMcap,
+    BuyTarget,            // unified: mcap / price-usd / persen-change
     BuyTip,
     BuyPrio,
-    BuyTargetPrice,
     // Quick preset editing (idx preset, field: 0=tip 1=prio)
     BuyPresetTip(usize),
     BuyPresetPrio(usize),
@@ -148,8 +147,7 @@ struct BotState {
     // Manual Limit Buy Settings (mode pembuatan order baru)
     active_token: Option<String>,
     buy_amount_usd: f64,
-    buy_target_mcap: String,
-    buy_target_price: String,        // harga target limit buy, misal "0.00000002" atau notasi singkat "0.72"
+    buy_target: String,          // unified target: mcap / price-usd / persen-change
     buy_tip_fee: f64,
     buy_prio_fee: f64,
 
@@ -310,8 +308,7 @@ async fn main() {
         preset_mega_prio: loaded_settings.preset_mega_prio,
         active_token: None,
         buy_amount_usd: 2.0,
-        buy_target_mcap: "50 Mcap".to_string(),
-        buy_target_price: String::new(),
+        buy_target: "50 Mcap".to_string(),
         buy_tip_fee: 0.001,
         buy_prio_fee: 0.001,
         buy_presets: Vec::new(),
@@ -544,11 +541,11 @@ async fn main() {
                                         } else {
                                             String::new()
                                         };
-                                        let swap_text = format!(
+                                        let _swap_text = format!(
                                             "🟢 *Pembelian Terdeteksi!*\n\n🏦 Token: `{}`\n\n{}*Klik tombol di bawah untuk Swap Sell atau lihat PNL:*",
                                             token_display, auto_info
                                         );
-                                        let swap_keyboard = teloxide::types::InlineKeyboardMarkup::new(vec![
+                                        let _swap_keyboard = teloxide::types::InlineKeyboardMarkup::new(vec![
                                             vec![teloxide::types::InlineKeyboardButton::callback(
                                                 "🔴 Confirm Swap Sell", "execute_swap_sell",
                                             )],
@@ -574,8 +571,7 @@ async fn main() {
                                                     id: order_id,
                                                     token: token.clone(),
                                                     amount_usd: 100.0,
-                                                    target_mcap: format!("PNL {}%", limit_pnl),
-                                                    target_price: String::new(),
+                                                    target: format!("{}%", limit_pnl),
                                                     tip_fee: limit_tip,
                                                     prio_fee: limit_prio,
                                                 };
@@ -840,22 +836,41 @@ fn make_autolimit_keyboard(st: &BotState) -> InlineKeyboardMarkup {
 }
 
 fn make_limitbuy_keyboard(st: &BotState) -> InlineKeyboardMarkup {
-    // ── Row preset Kecil/Sedang/Besar/Mega ──────────────────────────────────────
-    // Tampilkan 4 tombol preset, yang aktif diberi ✅
-    let preset_row: Vec<InlineKeyboardButton> = st.buy_presets.iter().enumerate().map(|(i, p)| {
+    // ── Tip & Prio aktif (dari preset aktif atau manual) ────────────────────────
+    let tip_label = format!("⚡ Tip | {} SOL", st.buy_tip_fee);
+    let prio_label = format!("⛽ P.Fee | {} SOL", st.buy_prio_fee);
+
+    // ── Target unified label ─────────────────────────────────────────────────────
+    let target_label = if st.buy_target.is_empty() {
+        "🎯 Target | (belum diset)".to_string()
+    } else {
+        format!("🎯 Target | {}", format_target_display(&st.buy_target))
+    };
+
+    let mut rows: Vec<Vec<InlineKeyboardButton>> = vec![];
+
+    // Row manual Tip & Prio
+    rows.push(vec![
+        InlineKeyboardButton::callback(tip_label, "edit_buy_tip"),
+        InlineKeyboardButton::callback(prio_label, "edit_buy_prio"),
+    ]);
+
+    // ── Row preset Kecil/Sedang/Besar/Mega: 4 tombol sejajar 1 baris, 2 baris tiap tombol ──
+    // Telegram tidak support newline di button text, jadi format: "Kecil\nT:x P:y"
+    // Kita bikin 4 tombol 1 baris saja
+    let mut preset_row: Vec<InlineKeyboardButton> = vec![];
+    for (i, p) in st.buy_presets.iter().enumerate() {
         let active = st.buy_active_preset == ActivePreset::Idx(i);
-        let label = if active {
-            format!("✅ {}", p.label)
-        } else {
-            p.label.clone()
-        };
-        InlineKeyboardButton::callback(label, format!("preset_select_{}", i))
-    }).collect();
+        let check = if active { "✅" } else { "" };
+        let label = format!("{}{}\nT:{} P:{}", check, p.label, p.tip, p.prio);
+        preset_row.push(InlineKeyboardButton::callback(label, format!("preset_select_{}", i)));
+    }
+    rows.push(preset_row);
 
     // ── Row edit nilai preset yang aktif (Tip & Prio-nya) ───────────────────────
-    let preset_edit_rows: Vec<Vec<InlineKeyboardButton>> = if let ActivePreset::Idx(idx) = &st.buy_active_preset {
+    if let ActivePreset::Idx(idx) = &st.buy_active_preset {
         let p = &st.buy_presets[*idx];
-        vec![vec![
+        rows.push(vec![
             InlineKeyboardButton::callback(
                 format!("✏️ {} Tip | {} SOL", p.label, p.tip),
                 format!("preset_edit_tip_{}", idx),
@@ -864,33 +879,9 @@ fn make_limitbuy_keyboard(st: &BotState) -> InlineKeyboardMarkup {
                 format!("✏️ {} Prio | {} SOL", p.label, p.prio),
                 format!("preset_edit_prio_{}", idx),
             ),
-        ]]
-    } else {
-        vec![]
-    };
+        ]);
+    }
 
-    // ── Tip & Prio aktif (dari preset aktif atau manual) ────────────────────────
-    let tip_label = format!("⚡ Tip | {} SOL", st.buy_tip_fee);
-    let prio_label = format!("⛽ P.Fee | {} SOL", st.buy_prio_fee);
-
-    // ── Target price label ───────────────────────────────────────────────────────
-    let price_label = if st.buy_target_price.is_empty() {
-        "🎯 Target Price | (belum diset)".to_string()
-    } else {
-        format!("🎯 Target Price | {}", format_price_display(&st.buy_target_price))
-    };
-
-    let mut rows: Vec<Vec<InlineKeyboardButton>> = vec![
-        // Row 1: preset selector
-        preset_row,
-    ];
-    // Row edit nilai preset (hanya muncul kalau ada preset aktif)
-    rows.extend(preset_edit_rows);
-    // Row manual Tip & Prio
-    rows.push(vec![
-        InlineKeyboardButton::callback(tip_label, "edit_buy_tip"),
-        InlineKeyboardButton::callback(prio_label, "edit_buy_prio"),
-    ]);
     // Row Slippage
     rows.push(vec![InlineKeyboardButton::callback("🏄‍♂️ Slippage | 90%", "none")]);
     // Row Side & Dip
@@ -903,13 +894,8 @@ fn make_limitbuy_keyboard(st: &BotState) -> InlineKeyboardMarkup {
         InlineKeyboardButton::callback("Activation | Instant", "none"),
         InlineKeyboardButton::callback(format!("💰 {:.2} $", st.buy_amount_usd), "edit_buy_amount"),
     ]);
-    // Row Target Mcap
-    rows.push(vec![InlineKeyboardButton::callback(
-        format!("📊 Target Mcap | {}", st.buy_target_mcap),
-        "edit_buy_mcap",
-    )]);
-    // Row Target Price
-    rows.push(vec![InlineKeyboardButton::callback(price_label, "edit_buy_price")]);
+    // Row Target (satu tombol unified)
+    rows.push(vec![InlineKeyboardButton::callback(target_label, "edit_buy_target")]);
     // Row Place Order
     rows.push(vec![InlineKeyboardButton::callback("📥 Place Order 📥", "place_limit_buy")]);
     // Row Back
@@ -918,97 +904,151 @@ fn make_limitbuy_keyboard(st: &BotState) -> InlineKeyboardMarkup {
     InlineKeyboardMarkup::new(rows)
 }
 
-/// Format harga untuk tampilan singkat:
-/// 0.00000002 → 0.₇2 (angka 7 kecil superscript sebagai pengganti jumlah nol)
-fn format_price_display(price_str: &str) -> String {
-    let s = price_str.trim();
-    // Coba parse sebagai f64
+/// Format harga untuk tampilan singkat (subscript zeros):
+/// 0.0000005$ → 0.0₆5$  (subscript digit menunjukkan jumlah nol)
+fn format_price_short(price_str: &str) -> String {
+    let s = price_str.trim().trim_end_matches('$').trim();
     if let Ok(val) = s.parse::<f64>() {
         if val > 0.0 && val < 1.0 {
-            // Hitung jumlah angka nol setelah titik desimal sebelum angka signifikan pertama
-            let after_dot = s.trim_start_matches('-').splitn(2, '.').nth(1).unwrap_or("");
+            let after_dot = s.splitn(2, '.').nth(1).unwrap_or("");
             let leading_zeros = after_dot.chars().take_while(|&c| c == '0').count();
             if leading_zeros >= 2 {
-                // Ambil angka signifikan setelah nol-nol
                 let sig = after_dot.trim_start_matches('0');
-                // Gunakan superscript digit untuk jumlah nol
-                let superscript = to_superscript(leading_zeros);
-                return format!("0.{}{}$", superscript, sig);
+                let sub = to_subscript(leading_zeros);
+                return format!("0.0{}{}$", sub, sig);
             }
         }
-        // Untuk harga biasa
         return format!("{}$", s);
     }
+    price_str.to_string()
+}
+
+/// Format target unified: detect apakah mcap, price, atau persen
+fn format_target_display(target: &str) -> String {
+    let s = target.trim();
+    let lower = s.to_lowercase();
+
+    // Persen change: mengandung '%'
+    if s.contains('%') {
+        return s.to_string();
+    }
+
+    // McAp: mengandung "mcap", "k", "m", dsb – atau tidak ada '$' dan tidak bisa di-parse sebagai angka kecil
+    if lower.contains("mcap") || lower.contains("cap") {
+        return s.to_string();
+    }
+
+    // Coba parse sebagai price (USD)
+    let stripped = s.trim_start_matches('$').trim_end_matches('$').trim();
+    if let Ok(val) = stripped.parse::<f64>() {
+        if val < 1.0 && val > 0.0 {
+            return format_price_short(stripped);
+        }
+        return format!("{}$", stripped);
+    }
+
+    // Fallback: tampilkan apa adanya
     s.to_string()
 }
 
-/// Konversi angka ke superscript unicode (untuk notasi jumlah nol)
-fn to_superscript(n: usize) -> String {
-    let digits = ['⁰','¹','²','³','⁴','⁵','⁶','⁷','⁸','⁹'];
+/// Konversi angka ke subscript unicode (untuk notasi jumlah nol)
+fn to_subscript(n: usize) -> String {
+    let digits = ['₀','₁','₂','₃','₄','₅','₆','₇','₈','₉'];
     n.to_string().chars().map(|c| {
         let d = c.to_digit(10).unwrap_or(0) as usize;
         digits[d]
     }).collect()
 }
 
-/// Parse harga dari input user.
-/// Mendukung 2 format:
-/// 1. Penuh: "0.00000002" → disimpan as-is
-/// 2. Singkat: "0.72" → "0." + angka pertama setelah titik sebagai jumlah nol + sisa angka
-///    Contoh: "0.72" → 7 nol, signifikan "2" → "0.00000002"
-/// Jika tidak bisa diparsing, return None.
-fn parse_compact_price(input: &str) -> Option<String> {
-    let s = input.trim().trim_end_matches('$').trim();
-    // Coba sebagai angka biasa dulu
-    if let Ok(val) = s.parse::<f64>() {
-        if val <= 0.0 { return None; }
-        if val >= 1.0 {
-            // Harga di atas 1 dollar, simpan as-is
-            return Some(format!("{}", val));
-        }
-        // val < 1.0
-        let after_dot = s.splitn(2, '.').nth(1).unwrap_or("");
-        let leading_zeros = after_dot.chars().take_while(|&c| c == '0').count();
-        
-        // Jika leading_zeros < 2, periksa apakah ini notasi singkat
-        // Notasi singkat: "0.72" → digit pertama = 7 (jumlah nol), digit berikutnya = 2 (signifikan)
-        if leading_zeros == 0 && after_dot.len() >= 2 {
-            // Cek: apakah digit pertama angka yang besar (≥2) menandakan jumlah nol?
-            let first_char = after_dot.chars().next()?;
-            let num_zeros = first_char.to_digit(10)? as usize;
-            if num_zeros >= 2 {
-                let sig_part = &after_dot[1..]; // angka setelah digit jumlah-nol
-                if !sig_part.is_empty() {
-                    let zeros = "0".repeat(num_zeros);
-                    return Some(format!("0.{}{}", zeros, sig_part));
-                }
+/// Parse input target universal dari user:
+/// - McAp: "100000 mcap" | "30K Mcap" | "11M mcap" | "2.35M mcap"
+/// - Price USD: "0.001$" | "$1" | "0.000005$"
+/// - Persen: "80%" | "-20%" | "%80"
+/// Mengembalikan (target_normalized, display_label) atau None jika tidak valid
+fn parse_target_input(input: &str) -> Option<String> {
+    let s = input.trim();
+    let lower = s.to_lowercase();
+
+    // Persen: mengandung '%'
+    if lower.contains('%') {
+        // normalize: hilangkan spasi, pastikan % ada di akhir atau awal
+        let clean = s.replace('%', "").trim().to_string();
+        if let Ok(val) = clean.parse::<f64>() {
+            if val == val { // valid number
+                // kembalikan dengan tanda % di akhir
+                return Some(format!("{}%", val));
             }
         }
-        // Format standar
+        // Coba handle format "-20%" atau "80%"
+        let num_part: String = s.chars().filter(|&c| c == '-' || c == '.' || c.is_ascii_digit()).collect();
+        if let Ok(val) = num_part.parse::<f64>() {
+            return Some(format!("{}%", val));
+        }
+        return None;
+    }
+
+    // Price USD: mengandung '$' atau bisa diparse sebagai angka kecil/besar
+    let stripped_dollar = s.trim_start_matches('$').trim_end_matches('$').trim();
+    if s.contains('$') {
+        if let Ok(val) = stripped_dollar.parse::<f64>() {
+            if val > 0.0 {
+                return Some(format!("{}", val));
+            }
+        }
+        return None;
+    }
+
+    // McAp: mengandung "mcap", "k", "m", dsb
+    if lower.contains("mcap") || lower.contains("cap") {
         return Some(s.to_string());
     }
+
+    // Angka dengan suffix K/M untuk mcap
+    if lower.ends_with('k') || lower.ends_with('m') {
+        return Some(s.to_string());
+    }
+
+    // Coba parse sebagai angka murni: jika < 1 → price, jika besar → mcap
+    if let Ok(val) = s.parse::<f64>() {
+        if val <= 0.0 { return None; }
+        if val < 100.0 {
+            // Kemungkinan price USD
+            return Some(format!("{}", val));
+        } else {
+            // Kemungkinan mcap (angka besar)
+            return Some(format!("{} Mcap", val));
+        }
+    }
+
     None
 }
 
-fn make_order_inline_keyboard(id: i64) -> InlineKeyboardMarkup {
+
+fn make_order_inline_keyboard(id: i64, st: &BotState) -> InlineKeyboardMarkup {
+    // 4 preset tombol sejajar 1 baris, format 2 baris: "Kecil\nT:x P:y"
+    let p0 = format!("Kecil\nT:{} P:{}", st.preset_kecil_tip, st.preset_kecil_prio);
+    let p1 = format!("Sedang\nT:{} P:{}", st.preset_sedang_tip, st.preset_sedang_prio);
+    let p2 = format!("Besar\nT:{} P:{}", st.preset_besar_tip, st.preset_besar_prio);
+    let p3 = format!("Mega\nT:{} P:{}", st.preset_mega_tip, st.preset_mega_prio);
+
     InlineKeyboardMarkup::new(vec![
         vec![
-            InlineKeyboardButton::callback("Kecil", format!("hist_preset_0_{}", id)),
-            InlineKeyboardButton::callback("Sedang", format!("hist_preset_1_{}", id)),
-            InlineKeyboardButton::callback("Besar", format!("hist_preset_2_{}", id)),
-            InlineKeyboardButton::callback("Mega", format!("hist_preset_3_{}", id)),
+            InlineKeyboardButton::callback(p0, format!("hist_preset_0_{}", id)),
+            InlineKeyboardButton::callback(p1, format!("hist_preset_1_{}", id)),
+            InlineKeyboardButton::callback(p2, format!("hist_preset_2_{}", id)),
+            InlineKeyboardButton::callback(p3, format!("hist_preset_3_{}", id)),
         ],
-        vec![InlineKeyboardButton::callback("TARGET", format!("edit_hist_target_{}", id))],
-        vec![InlineKeyboardButton::callback("HAPUS", format!("delete_order_{}", id))],
+        vec![InlineKeyboardButton::callback("🎯 TARGET", format!("edit_hist_target_{}", id))],
+        vec![InlineKeyboardButton::callback("🗑 HAPUS", format!("delete_order_{}", id))],
     ])
 }
 
 fn make_setup_keyboard(st: &BotState) -> InlineKeyboardMarkup {
     InlineKeyboardMarkup::new(vec![
-        vec![InlineKeyboardButton::callback(format!("Kecil (Tip: {}, Prio: {})", st.preset_kecil_tip, st.preset_kecil_prio), "setup_preset_0")],
-        vec![InlineKeyboardButton::callback(format!("Sedang (Tip: {}, Prio: {})", st.preset_sedang_tip, st.preset_sedang_prio), "setup_preset_1")],
-        vec![InlineKeyboardButton::callback(format!("Besar (Tip: {}, Prio: {})", st.preset_besar_tip, st.preset_besar_prio), "setup_preset_2")],
-        vec![InlineKeyboardButton::callback(format!("Mega (Tip: {}, Prio: {})", st.preset_mega_tip, st.preset_mega_prio), "setup_preset_3")],
+        vec![InlineKeyboardButton::callback(format!("Kecil T: {} P: {}", st.preset_kecil_tip, st.preset_kecil_prio), "setup_preset_0")],
+        vec![InlineKeyboardButton::callback(format!("Sedang T: {} P: {}", st.preset_sedang_tip, st.preset_sedang_prio), "setup_preset_1")],
+        vec![InlineKeyboardButton::callback(format!("Besar T: {} P: {}", st.preset_besar_tip, st.preset_besar_prio), "setup_preset_2")],
+        vec![InlineKeyboardButton::callback(format!("Mega T: {} P: {}", st.preset_mega_tip, st.preset_mega_prio), "setup_preset_3")],
         vec![InlineKeyboardButton::callback("<< Back", "menu_main")],
     ])
 }
@@ -1018,12 +1058,12 @@ fn make_setup_keyboard(st: &BotState) -> InlineKeyboardMarkup {
 async fn send_limitbuy_menu(bot: &Bot, chat_id: ChatId, st: &BotState) -> ResponseResult<()> {
     if let Some(token) = &st.active_token {
         let short = format!("{}...{}", &token[..6], &token[token.len()-4..]);
-        let price_info = if !st.buy_target_price.is_empty() {
-            format!("\n💲 Target Price: `{}`", format_price_display(&st.buy_target_price))
+        let target_info = if !st.buy_target.is_empty() {
+            format!("\n🎯 Target: `{}`", format_target_display(&st.buy_target))
         } else {
             String::new()
         };
-        let text = format!("🏦 **Token:** `{}`{}\n\n*Silakan klik tombol yang ingin diubah, lalu ketik nilainya.*", short, price_info);
+        let text = format!("🏦 **Token:** `{}`{}\n\n*Silakan klik tombol yang ingin diubah, lalu ketik nilainya.*", short, target_info);
         bot.send_message(chat_id, text).reply_markup(make_limitbuy_keyboard(st)).await?;
     }
     Ok(())
@@ -1031,21 +1071,16 @@ async fn send_limitbuy_menu(bot: &Bot, chat_id: ChatId, st: &BotState) -> Respon
 
 fn order_detail_text(o: &LimitOrder) -> String {
     let short = format!("{}...{}", &o.token[..6], &o.token[o.token.len()-4..]);
-    let price_line = if !o.target_price.is_empty() {
-        format!("\n💲 Target Price: {}", format_price_display(&o.target_price))
-    } else {
-        String::new()
-    };
     format!(
-        "📋 **Detail Order #{}**\n\nToken: `{}`\nFull: `{}`\n\n💰 Jumlah Beli: ${:.2}\n📊 Target Mcap: {}{}
+        "📋 **Detail Order #{}**\n\nToken: `{}`\nFull: `{}`\n\n💰 Jumlah Beli: ${:.2}\n🎯 Target: {}\
 \n⚡ Tip: {} SOL\n⛽ P.Fee: {} SOL\n🏄‍♂️ Slippage: 90%\n\n*Klik tombol yang ingin diedit, lalu balas dengan nominal barunya.*",
-        o.id, short, o.token, o.amount_usd, o.target_mcap, price_line, o.tip_fee, o.prio_fee
+        o.id, short, o.token, o.amount_usd, format_target_display(&o.target), o.tip_fee, o.prio_fee
     )
 }
 
 
-fn make_order_detail_keyboard(o: &LimitOrder) -> InlineKeyboardMarkup {
-    make_order_inline_keyboard(o.id as i64)
+fn make_order_detail_keyboard(o: &LimitOrder, st: &BotState) -> InlineKeyboardMarkup {
+    make_order_inline_keyboard(o.id as i64, st)
 }
 
 fn parse_number(text: &str) -> Option<f64> {
@@ -1138,11 +1173,24 @@ async fn handle_text_message(
                     send_limitbuy_menu(&bot, chat_id, &st).await?;
                 }
             }
-            EditField::BuyMcap => {
-                st.buy_target_mcap = text_trim.to_string();
-                st.edit_field = EditField::None;
-                send_limitbuy_menu(&bot, chat_id, &st).await?;
+            EditField::BuyTarget => {
+                // Parse universal target: mcap / price-usd / persen-change
+                // Contoh: "100000 mcap" | "30K Mcap" | "0.000005$" | "80%" | "-20%"
+                if let Some(parsed) = parse_target_input(text_trim) {
+                    st.buy_target = parsed;
+                    st.edit_field = EditField::None;
+                    send_limitbuy_menu(&bot, chat_id, &st).await?;
+                } else {
+                    bot.send_message(chat_id,
+                        "❌ Format tidak valid.\n\n\
+                        Gunakan salah satu:\n\
+                        • *McAp*: `100000 mcap` | `30K Mcap` | `11M mcap`\n\
+                        • *Price USD*: `0.000005$` | `$1` | `0.001$`\n\
+                        • *Persen*: `80%` | `-20%` | `%80`"
+                    ).await?;
+                }
             }
+
             EditField::BuyTip => {
                 if let Some(val) = parse_number(&lower) {
                     st.buy_tip_fee = val;
@@ -1155,17 +1203,6 @@ async fn handle_text_message(
                     st.buy_prio_fee = val;
                     st.edit_field = EditField::None;
                     send_limitbuy_menu(&bot, chat_id, &st).await?;
-                }
-            }
-            EditField::BuyTargetPrice => {
-                // Mendukung notasi singkat "0.72" (7 nol → 0.00000002) atau penuh
-                let raw = text_trim.trim_end_matches('$').trim();
-                if let Some(parsed) = parse_compact_price(raw) {
-                    st.buy_target_price = parsed;
-                    st.edit_field = EditField::None;
-                    send_limitbuy_menu(&bot, chat_id, &st).await?;
-                } else {
-                    bot.send_message(chat_id, "❌ Format harga tidak valid. Contoh: `0.00000002` atau singkat `0.72`").await?;
                 }
             }
             EditField::BuyPresetTip(idx) => {
@@ -1217,6 +1254,32 @@ async fn handle_text_message(
                     .reply_markup(make_swapsell_keyboard(&st)).await?;
             }
             EditField::AutoTip => {
+                if lower.contains("tip") || lower.contains("prio") {
+                    let mut tip_updated = false;
+                    let mut prio_updated = false;
+                    let tokens: Vec<&str> = lower.split_whitespace().collect();
+                    for i in 0..tokens.len() {
+                        if tokens[i] == "tip" && i + 1 < tokens.len() {
+                            if let Some(val) = parse_number(tokens[i+1]) {
+                                st.limit_tip_fee = val;
+                                tip_updated = true;
+                            }
+                        } else if (tokens[i] == "prio" || tokens[i] == "priority") && i + 1 < tokens.len() {
+                            if let Some(val) = parse_number(tokens[i+1]) {
+                                st.limit_prio_fee = val;
+                                prio_updated = true;
+                            }
+                        }
+                    }
+                    if tip_updated || prio_updated {
+                        st.edit_field = EditField::None;
+                        st.save_db();
+                        bot.send_message(chat_id, "✅ Auto Limit Tip/Prio berhasil diperbarui!")
+                            .reply_markup(make_autolimit_keyboard(&st)).await?;
+                        return Ok(());
+                    }
+                }
+                
                 if let Some(val) = parse_number(&lower) {
                     st.limit_tip_fee = val;
                     st.edit_field = EditField::None;
@@ -1249,15 +1312,15 @@ async fn handle_text_message(
                     if let Some(o) = st.orders.iter_mut().find(|o| o.id == id) { o.amount_usd = val; }
                     st.edit_field = EditField::None;
                     if let Some(o) = st.orders.iter().find(|o| o.id == id).cloned() {
-                        bot.send_message(chat_id, order_detail_text(&o)).reply_markup(make_order_detail_keyboard(&o)).await?;
+                        bot.send_message(chat_id, order_detail_text(&o)).reply_markup(make_order_detail_keyboard(&o, &st)).await?;
                     }
                 }
             }
             EditField::HistMcap(id) => {
-                if let Some(o) = st.orders.iter_mut().find(|o| o.id == id) { o.target_mcap = text_trim.to_string(); }
+                if let Some(o) = st.orders.iter_mut().find(|o| o.id == id) { o.target = text_trim.to_string(); }
                 st.edit_field = EditField::None;
                 if let Some(o) = st.orders.iter().find(|o| o.id == id).cloned() {
-                    bot.send_message(chat_id, order_detail_text(&o)).reply_markup(make_order_detail_keyboard(&o)).await?;
+                    bot.send_message(chat_id, order_detail_text(&o)).reply_markup(make_order_detail_keyboard(&o, &st)).await?;
                 }
             }
             EditField::HistTip(id) => {
@@ -1265,7 +1328,7 @@ async fn handle_text_message(
                     if let Some(o) = st.orders.iter_mut().find(|o| o.id == id) { o.tip_fee = val; }
                     st.edit_field = EditField::None;
                     if let Some(o) = st.orders.iter().find(|o| o.id == id).cloned() {
-                        bot.send_message(chat_id, order_detail_text(&o)).reply_markup(make_order_detail_keyboard(&o)).await?;
+                        bot.send_message(chat_id, order_detail_text(&o)).reply_markup(make_order_detail_keyboard(&o, &st)).await?;
                     }
                 }
             }
@@ -1274,27 +1337,73 @@ async fn handle_text_message(
                     if let Some(o) = st.orders.iter_mut().find(|o| o.id == id) { o.prio_fee = val; }
                     st.edit_field = EditField::None;
                     if let Some(o) = st.orders.iter().find(|o| o.id == id).cloned() {
-                        bot.send_message(chat_id, order_detail_text(&o)).reply_markup(make_order_detail_keyboard(&o)).await?;
+                        bot.send_message(chat_id, order_detail_text(&o)).reply_markup(make_order_detail_keyboard(&o, &st)).await?;
                     }
                 }
             }
             EditField::HistTarget(id) => {
+                // Validasi dan normalisasi target input
+                let normalized = parse_target_input(text_trim).unwrap_or_else(|| text_trim.to_string());
                 let update_result = if let Ok(conn) = st.db_conn.try_lock() {
                     let orders = db::load_limit_orders(&conn).unwrap_or_default();
                     if let Some(o) = orders.iter().find(|o| o.id == id) {
-                        let _ = db::update_limit_order(&conn, id, text_trim, o.tip_fee, o.prio_fee);
+                        let _ = db::update_limit_order(&conn, id, &normalized, o.tip_fee, o.prio_fee);
+                        let short_token = if o.token.len() >= 10 {
+                            format!("{}...{}", &o.token[..6], &o.token[o.token.len()-4..])
+                        } else {
+                            o.token.clone()
+                        };
                         Some(format!(
-                            "#{} LIMIT ORDER | {}\nToken: `{}`\nTarget: {}\n⚡ Tip: {} SOL | ⛽ Prio: {} SOL",
-                            o.id, o.order_type, o.token, text_trim, o.tip_fee, o.prio_fee
+                            "#{} LIMIT ORDER | {}\nToken: {}\n🎯 Target | {}",
+                            o.id, o.order_type, short_token, format_target_display(&normalized)
                         ))
                     } else { None }
                 } else { None };
                 st.edit_field = EditField::None;
                 if let Some(txt) = update_result {
-                    bot.send_message(chat_id, txt).reply_markup(make_order_inline_keyboard(id)).await?;
+                    bot.send_message(chat_id, txt).reply_markup(make_order_inline_keyboard(id, &st)).await?;
                 }
             }
             EditField::SetupPresetTip(idx) => {
+                if lower.contains("tip") || lower.contains("prio") {
+                    let mut tip_updated = false;
+                    let mut prio_updated = false;
+                    let tokens: Vec<&str> = lower.split_whitespace().collect();
+                    for i in 0..tokens.len() {
+                        if tokens[i] == "tip" && i + 1 < tokens.len() {
+                            if let Some(val) = parse_number(tokens[i+1]) {
+                                match idx {
+                                    0 => st.preset_kecil_tip = val,
+                                    1 => st.preset_sedang_tip = val,
+                                    2 => st.preset_besar_tip = val,
+                                    _ => st.preset_mega_tip = val,
+                                }
+                                tip_updated = true;
+                            }
+                        } else if (tokens[i] == "prio" || tokens[i] == "priority") && i + 1 < tokens.len() {
+                            if let Some(val) = parse_number(tokens[i+1]) {
+                                match idx {
+                                    0 => st.preset_kecil_prio = val,
+                                    1 => st.preset_sedang_prio = val,
+                                    2 => st.preset_besar_prio = val,
+                                    _ => st.preset_mega_prio = val,
+                                }
+                                prio_updated = true;
+                            }
+                        }
+                    }
+                    if tip_updated || prio_updated {
+                        st.sync_presets();
+                        st.save_db();
+                        st.edit_field = EditField::None;
+                        let label = match idx { 0 => "Kecil", 1 => "Sedang", 2 => "Besar", _ => "Mega" };
+                        bot.send_message(chat_id, format!("✅ Preset **{}** berhasil diperbarui!", label))
+                            .reply_markup(make_setup_keyboard(&st)).await?;
+                        return Ok(());
+                    }
+                }
+                
+                // Fallback (sequential)
                 if let Some(val) = parse_number(&lower) {
                     match idx {
                         0 => st.preset_kecil_tip = val,
@@ -1332,7 +1441,7 @@ async fn handle_text_message(
                         if st.active_token.is_some() { send_limitbuy_menu(&bot, chat_id, &st).await?; }
                     }
                 } else if lower.contains("mcap") {
-                    st.buy_target_mcap = text_trim.to_string();
+                    st.buy_target = text_trim.to_string();
                     if st.active_token.is_some() { send_limitbuy_menu(&bot, chat_id, &st).await?; }
                 } else if lower.ends_with("sol") {
                     if let Some(val) = parse_number(&lower) {
@@ -1383,23 +1492,29 @@ async fn handle_callback(
             if parts.len() == 4 {
                 let preset_idx: usize = parts[2].parse().unwrap_or(0);
                 let order_id: i64 = parts[3].parse().unwrap_or(0);
-                let (tip, prio) = match preset_idx {
-                    0 => (st.preset_kecil_tip, st.preset_kecil_prio),
-                    1 => (st.preset_sedang_tip, st.preset_sedang_prio),
-                    2 => (st.preset_besar_tip, st.preset_besar_prio),
-                    _ => (st.preset_mega_tip, st.preset_mega_prio),
+                let (tip, prio, preset_label) = match preset_idx {
+                    0 => (st.preset_kecil_tip, st.preset_kecil_prio, "Kecil"),
+                    1 => (st.preset_sedang_tip, st.preset_sedang_prio, "Sedang"),
+                    2 => (st.preset_besar_tip, st.preset_besar_prio, "Besar"),
+                    _ => (st.preset_mega_tip, st.preset_mega_prio, "Mega"),
                 };
                 if let Ok(conn) = st.db_conn.try_lock() {
                     let orders = db::load_limit_orders(&conn).unwrap_or_default();
                     if let Some(o) = orders.iter().find(|o| o.id == order_id) {
                         let _ = db::update_limit_order(&conn, order_id, &o.target, tip, prio);
-                        bot.answer_callback_query(q.id.clone()).text("Preset diaplikasikan!").await?;
-                        // update msg
+                        bot.answer_callback_query(q.id.clone()).text(format!("✅ Preset {} diaplikasikan!", preset_label)).await?;
+                        // update msg - format baru
+                        let short_token = if o.token.len() >= 10 {
+                            format!("{}...{}", &o.token[..6], &o.token[o.token.len()-4..])
+                        } else {
+                            o.token.clone()
+                        };
+                        let target_display = format_target_display(&o.target);
                         let text = format!(
-                            "#{} LIMIT ORDER | {}\nToken: `{}`\nTarget: {}\n(Tip: {} SOL, Prio: {} SOL)",
-                            o.id, o.order_type, o.token, o.target, tip, prio
+                            "#{} LIMIT ORDER | {}\nToken: {}\n🎯 Target | {}\n⚡ T:{} SOL ⛽ P:{} SOL",
+                            o.id, o.order_type, short_token, target_display, tip, prio
                         );
-                        bot.edit_message_text(chat_id, msg_id, text).reply_markup(make_order_inline_keyboard(o.id)).await?;
+                        bot.edit_message_text(chat_id, msg_id, text).reply_markup(make_order_inline_keyboard(o.id, &st)).await?;
                         return Ok(());
                     }
                 }
@@ -1409,8 +1524,13 @@ async fn handle_callback(
         if data.starts_with("edit_hist_target_") {
             let id: i64 = data.trim_start_matches("edit_hist_target_").parse().unwrap_or(0);
             st.edit_field = EditField::HistTarget(id);
-            bot.answer_callback_query(q.id.clone()).text("Ketik target baru!").await?;
-            bot.send_message(chat_id, "✏️ Ketik target baru").await?;
+            bot.answer_callback_query(q.id.clone()).text("Aim & Slay 🌞 Ketik target!").await?;
+            bot.send_message(chat_id,
+                "🎯 Ketik target baru:\n\n\
+                • McAp: `100K mcap` | `11M mcap` | `2.35M mcap`\n\
+                • Price: `0.000005$` | `$1`\n\
+                • Persen: `80%` | `-20%`"
+            ).await?;
             return Ok(());
         }
 
@@ -1637,22 +1757,19 @@ async fn handle_callback(
                 bot.answer_callback_query(q.id.clone()).text("Menunggu input jumlah...").await?;
                 bot.send_message(chat_id, "✏️ Ketik jumlah USD beli baru (contoh: 5)").await?;
             }
-            "edit_buy_mcap" => {
-                st.edit_field = EditField::BuyMcap;
-                bot.answer_callback_query(q.id.clone()).text("Menunggu input target...").await?;
-                bot.send_message(chat_id, "✏️ Ketik target Mcap baru (contoh: 100 mcap)").await?;
-            }
-            "edit_buy_price" => {
-                st.edit_field = EditField::BuyTargetPrice;
-                bot.answer_callback_query(q.id.clone()).text("Ketik harga target...").await?;
+            "edit_buy_target" => {
+                st.edit_field = EditField::BuyTarget;
+                bot.answer_callback_query(q.id.clone()).text("Aim & Slay 🌞 Ketik target...").await?;
                 bot.send_message(chat_id,
-                    "✏️ Ketik harga target limit buy.\n\
-                    \n\
-                    Format:\n\
-                    • Lengkap: `0.00000002`\n\
-                    • Singkat: `0.72` artinya 0.0000007 dengan 7 nol = 0.⁷2\n\
-                    \n\
-                    Bot akan otomatis memformat tampilan.").await?;
+                    "🎯 *Aim \\& Slay* 🌞\n\
+                    Plug in your numbers\\. Your set \\- your rules\\.\n\n\
+                    〽️ *Market Cap in USD*\n\
+                    `100000 mcap` \\| `30K Mcap` \\| `11M mcap` \\| `2\\.35M mcap`\n\n\
+                    💸 *Price in USD*\n\
+                    `0\\.001$` \\| `$1` \\| `0\\.0000005$`\n\n\
+                    💹 *Price Percentage Change*\n\
+                    `80%` \\| `\\-20%` \\| `%80`"
+                ).await?;
             }
             "edit_buy_tip" => {
                 st.edit_field = EditField::BuyTip;
@@ -1666,17 +1783,12 @@ async fn handle_callback(
             }
             "place_limit_buy" => {
                 if let Some(token) = &st.active_token {
-                    let target = if !st.buy_target_price.is_empty() {
-                        st.buy_target_price.clone()
-                    } else {
-                        st.buy_target_mcap.clone()
-                    };
+                    let target = st.buy_target.clone();
                     let o = LimitOrder {
                         id: st.next_order_id,
                         token: token.clone(),
                         amount_usd: st.buy_amount_usd,
-                        target_mcap: st.buy_target_mcap.clone(),
-                        target_price: st.buy_target_price.clone(),
+                        target: target.clone(),
                         tip_fee: st.buy_tip_fee,
                         prio_fee: st.buy_prio_fee,
                     };
@@ -1790,13 +1902,23 @@ async fn send_history_orders(bot: &Bot, chat_id: ChatId, st: &BotState) -> Respo
         if orders.is_empty() {
             bot.send_message(chat_id, "📭 Belum ada limit order yang aktif.").await?;
         } else {
-            for o in orders {
+            // Numbering ulang dari 1 berdasarkan urutan aktif, bukan DB id
+            for (idx, o) in orders.iter().enumerate() {
+                let display_num = idx + 1;
+                // Format nama token: gunakan 6 char awal ... 4 char akhir
+                let short_token = if o.token.len() >= 10 {
+                    format!("{}...{}", &o.token[..6], &o.token[o.token.len()-4..])
+                } else {
+                    o.token.clone()
+                };
+                // Format target dengan display method
+                let target_display = format_target_display(&o.target);
                 let text = format!(
-                    "#{} LIMIT ORDER | {}\nToken: `{}`\nTarget: {}\n⚡ Tip: {} SOL | ⛽ Prio: {} SOL",
-                    o.id, o.order_type, o.token, o.target, o.tip_fee, o.prio_fee
+                    "#{} LIMIT ORDER | {}\nToken: {}\n🎯 Target | {}",
+                    display_num, o.order_type, short_token, target_display
                 );
                 bot.send_message(chat_id, text)
-                    .reply_markup(make_order_inline_keyboard(o.id))
+                    .reply_markup(make_order_inline_keyboard(o.id, st))
                     .await?;
             }
         }
@@ -1805,6 +1927,7 @@ async fn send_history_orders(bot: &Bot, chat_id: ChatId, st: &BotState) -> Respo
     }
     Ok(())
 }
+
 
 async fn send_error_logs(bot: &Bot, chat_id: ChatId, st: &BotState) -> ResponseResult<()> {
     if let Ok(conn) = st.db_conn.try_lock() {
