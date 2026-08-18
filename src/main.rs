@@ -1025,11 +1025,33 @@ fn parse_target_input(input: &str) -> Option<String> {
 
 
 fn make_order_inline_keyboard(id: i64, st: &BotState) -> InlineKeyboardMarkup {
-    // 4 preset tombol sejajar 1 baris, format 2 baris: "Kecil\nT:x P:y"
-    let p0 = format!("Kecil\nT:{} P:{}", st.preset_kecil_tip, st.preset_kecil_prio);
-    let p1 = format!("Sedang\nT:{} P:{}", st.preset_sedang_tip, st.preset_sedang_prio);
-    let p2 = format!("Besar\nT:{} P:{}", st.preset_besar_tip, st.preset_besar_prio);
-    let p3 = format!("Mega\nT:{} P:{}", st.preset_mega_tip, st.preset_mega_prio);
+    let mut current_tip = 0.0;
+    let mut current_prio = 0.0;
+    
+    if let Ok(conn) = st.db_conn.try_lock() {
+        if let Some(orders) = db::load_limit_orders(&conn).ok() {
+            if let Some(o) = orders.iter().find(|o| o.id == id) {
+                current_tip = o.tip_fee;
+                current_prio = o.prio_fee;
+            }
+        }
+    }
+
+    let mut p0 = format!("Kecil\nT:{} P:{}", st.preset_kecil_tip, st.preset_kecil_prio);
+    let mut p1 = format!("Sedang\nT:{} P:{}", st.preset_sedang_tip, st.preset_sedang_prio);
+    let mut p2 = format!("Besar\nT:{} P:{}", st.preset_besar_tip, st.preset_besar_prio);
+    let mut p3 = format!("Mega\nT:{} P:{}", st.preset_mega_tip, st.preset_mega_prio);
+
+    let epsilon = 0.000001;
+    if (current_tip - st.preset_kecil_tip).abs() < epsilon && (current_prio - st.preset_kecil_prio).abs() < epsilon {
+        p0 = format!("✅ Kecil\nT:{} P:{}", st.preset_kecil_tip, st.preset_kecil_prio);
+    } else if (current_tip - st.preset_sedang_tip).abs() < epsilon && (current_prio - st.preset_sedang_prio).abs() < epsilon {
+        p1 = format!("✅ Sedang\nT:{} P:{}", st.preset_sedang_tip, st.preset_sedang_prio);
+    } else if (current_tip - st.preset_besar_tip).abs() < epsilon && (current_prio - st.preset_besar_prio).abs() < epsilon {
+        p2 = format!("✅ Besar\nT:{} P:{}", st.preset_besar_tip, st.preset_besar_prio);
+    } else if (current_tip - st.preset_mega_tip).abs() < epsilon && (current_prio - st.preset_mega_prio).abs() < epsilon {
+        p3 = format!("✅ Mega\nT:{} P:{}", st.preset_mega_tip, st.preset_mega_prio);
+    }
 
     InlineKeyboardMarkup::new(vec![
         vec![
@@ -1346,7 +1368,9 @@ async fn handle_text_message(
                 let normalized = parse_target_input(text_trim).unwrap_or_else(|| text_trim.to_string());
                 let update_result = if let Ok(conn) = st.db_conn.try_lock() {
                     let orders = db::load_limit_orders(&conn).unwrap_or_default();
-                    if let Some(o) = orders.iter().find(|o| o.id == id) {
+                    if let Some(pos) = orders.iter().position(|o| o.id == id) {
+                        let o = &orders[pos];
+                        let display_num = pos + 1;
                         let _ = db::update_limit_order(&conn, id, &normalized, o.tip_fee, o.prio_fee);
                         let short_token = if o.token.len() >= 10 {
                             format!("{}...{}", &o.token[..6], &o.token[o.token.len()-4..])
@@ -1354,8 +1378,8 @@ async fn handle_text_message(
                             o.token.clone()
                         };
                         Some(format!(
-                            "#{} LIMIT ORDER | {}\nToken: {}\n🎯 Target | {}",
-                            o.id, o.order_type, short_token, format_target_display(&normalized)
+                            "#{} LIMIT ORDER | {}\nToken: {}\n🎯 Target | {}\n⚡ T:{} SOL ⛽ P:{} SOL",
+                            display_num, o.order_type, short_token, format_target_display(&normalized), o.tip_fee, o.prio_fee
                         ))
                     } else { None }
                 } else { None };
@@ -1500,7 +1524,9 @@ async fn handle_callback(
                 };
                 if let Ok(conn) = st.db_conn.try_lock() {
                     let orders = db::load_limit_orders(&conn).unwrap_or_default();
-                    if let Some(o) = orders.iter().find(|o| o.id == order_id) {
+                    if let Some(pos) = orders.iter().position(|o| o.id == order_id) {
+                        let o = &orders[pos];
+                        let display_num = pos + 1;
                         let _ = db::update_limit_order(&conn, order_id, &o.target, tip, prio);
                         bot.answer_callback_query(q.id.clone()).text(format!("✅ Preset {} diaplikasikan!", preset_label)).await?;
                         // update msg - format baru
@@ -1512,7 +1538,7 @@ async fn handle_callback(
                         let target_display = format_target_display(&o.target);
                         let text = format!(
                             "#{} LIMIT ORDER | {}\nToken: {}\n🎯 Target | {}\n⚡ T:{} SOL ⛽ P:{} SOL",
-                            o.id, o.order_type, short_token, target_display, tip, prio
+                            display_num, o.order_type, short_token, target_display, tip, prio
                         );
                         bot.edit_message_text(chat_id, msg_id, text).reply_markup(make_order_inline_keyboard(o.id, &st)).await?;
                         return Ok(());
@@ -1914,8 +1940,8 @@ async fn send_history_orders(bot: &Bot, chat_id: ChatId, st: &BotState) -> Respo
                 // Format target dengan display method
                 let target_display = format_target_display(&o.target);
                 let text = format!(
-                    "#{} LIMIT ORDER | {}\nToken: {}\n🎯 Target | {}",
-                    display_num, o.order_type, short_token, target_display
+                    "#{} LIMIT ORDER | {}\nToken: {}\n🎯 Target | {}\n⚡ T:{} SOL ⛽ P:{} SOL",
+                    display_num, o.order_type, short_token, target_display, o.tip_fee, o.prio_fee
                 );
                 bot.send_message(chat_id, text)
                     .reply_markup(make_order_inline_keyboard(o.id, st))
