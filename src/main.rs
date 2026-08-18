@@ -63,6 +63,7 @@ struct LimitOrder {
     target: String,       // unified target: mcap / price-usd / persen-change
     tip_fee: f64,
     prio_fee: f64,
+    aura_order_id: Option<i64>,
 }
 
 /// Preset tip/prio untuk quick-set (Kecil/Sedang/Besar/Mega)
@@ -115,7 +116,7 @@ enum EditField {
     SetupPresetTip(usize),
     SetupPresetPrio(usize),
     // Legacy (kept for compat)
-    HistAmount(usize),
+    HistAmount(i64),
     HistMcap(usize),
     HistTip(usize),
     HistPrio(usize),
@@ -177,6 +178,9 @@ struct BotState {
 
     // Deduplikasi tx signature dari stream
     processed_signatures: std::collections::HashSet<String>,
+
+    // Token aktif yang dibeli (untuk tombol konfirmasi swap sell)
+    bought_token: Option<String>,
 }
 
 impl BotState {
@@ -198,6 +202,7 @@ impl BotState {
             preset_besar_prio: self.preset_besar_prio,
             preset_mega_tip: self.preset_mega_tip,
             preset_mega_prio: self.preset_mega_prio,
+            bought_token: self.bought_token.clone(),
         }
     }
 
@@ -318,6 +323,7 @@ async fn main() {
         active_chats: initial_chats,
         swap_panel_msgs: Vec::new(),
         processed_signatures: std::collections::HashSet::new(),
+        bought_token: loaded_settings.bought_token,
     };
     st.sync_presets();
     let state = Arc::new(Mutex::new(st));
@@ -383,12 +389,15 @@ async fn main() {
                         info!("UserActivity Stream tersambung!");
                         // Aktifkan flag → ping loop bisa mulai
                         stream_ready_listener.store(true, Ordering::Relaxed);
+                        
+                        let mut pending_limit_sigs: std::collections::HashMap<String, (String, i64)> = std::collections::HashMap::new();
+
                         while let Some(msg) = stream.next().await {
                             match msg {
                                 Ok(action) => {
                                     use aura_api_client::types::{
                                         UserAction, TradeStateUpdate, TxnConfirmState,
-                                        ParsedTradeUi,
+                                        ParsedTradeUi, ConfirmTradeKind,
                                     };
 
                                     // ── Pong/Ping: log saja, skip ──
@@ -398,6 +407,53 @@ async fn main() {
 
                                     // ── SELALU log ke server (bukan Telegram) ──
                                     info!("[Aura Stream] {:?}", action);
+
+                                    // ── Deteksi Limit Order Triggered ──
+                                    if let UserAction::TradeEvent(confirm_state) = &action {
+                                        if let ConfirmTradeKind::LimitOrder { token, order } = &confirm_state.confirm_trade_kind {
+                                            let aura_id = if let aura_api_client::types::OrderState::Placed { id, .. } = &order.state { id.0 } else { 0 };
+                                            if aura_id != 0 {
+                                                let token_str = format!("{}", token);
+                                                for sig in &confirm_state.sigs {
+                                                    pending_limit_sigs.insert(format!("{}", sig), (token_str.clone(), aura_id));
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // ── Deteksi Transaksi Gagal ──
+                                    if let UserAction::TradeCallback(TradeStateUpdate::Landed { state: TxnConfirmState::Failed { err, .. }, signature }) = &action {
+                                        let sig_str = format!("{}", signature);
+                                        if let Some((token, aura_id)) = pending_limit_sigs.remove(&sig_str) {
+                                            info!("[Aura Stream] Limit Order Gagal on-chain! AuraID={}, Err={:?}", aura_id, err);
+                                            let mut local_id = aura_id;
+                                            let err_msg = format!("{:?}", err);
+                                            
+                                            // Ambil chat IDs
+                                            let chats = {
+                                                let st = st_clone.lock().await;
+                                                st.active_chats.clone()
+                                            };
+                                            
+                                            let db_conn_clone = {
+                                                let st = st_clone.lock().await;
+                                                st.db_conn.clone()
+                                            };
+                                            if let Ok(conn) = db_conn_clone.try_lock() {
+                                                if let Ok(orders) = crate::db::load_limit_orders(&conn) {
+                                                    if let Some(o) = orders.iter().find(|o| o.aura_order_id == Some(aura_id)) {
+                                                        local_id = o.id;
+                                                    }
+                                                }
+                                                let _ = crate::db::insert_error_log(&conn, local_id, &token, &err_msg);
+                                            }
+                                            
+                                            let err_text = format!("⚠️ *Limit Order Gagal Dieksekusi (Aura)*\n\n🏦 Token: `{}`\n❌ Error: `{}`\n\n_Log telah tersimpan, buka menu 📜 Limit Order Logs untuk detailnya._", token, err_msg);
+                                            for chat in chats {
+                                                let _ = bot_clone.send_message(chat, &err_text).parse_mode(teloxide::types::ParseMode::Markdown).await;
+                                            }
+                                        }
+                                    }
 
                                     // ── Deteksi SELL on-chain (auto limit terpenuhi) ──
                                     // Ini harus dicek SEBELUM BUY agar tidak tertukar
@@ -464,10 +520,12 @@ async fn main() {
                                                     }
                                                 }
 
-                                                // Clear panel msgs setelah terjual
+                                                // Clear panel msgs & bought_token setelah terjual
                                                 {
                                                     let mut st = st_clone.lock().await;
                                                     st.swap_panel_msgs.clear();
+                                                    st.bought_token = None;
+                                                    st.save_db();
                                                 }
                                                 continue; // skip ke event berikutnya
                                             }
@@ -520,6 +578,8 @@ async fn main() {
                                             if let Some(ref mint) = mint_from_event {
                                                 if mint.len() >= 32 {
                                                     st.active_token = Some(mint.clone());
+                                                    st.bought_token = Some(mint.clone());
+                                                    st.save_db();
                                                 }
                                             }
                                             (
@@ -574,13 +634,17 @@ async fn main() {
                                                     target: format!("{}%", limit_pnl),
                                                     tip_fee: limit_tip,
                                                     prio_fee: limit_prio,
+                                                    aura_order_id: None,
                                                 };
                                                 st.orders.push(new_order.clone());
                                                 st.next_order_id += 1;
                                                 // Save to SQLite
                                                 let db_conn_clone = st.db_conn.clone();
+                                                let mut db_id = 0;
                                                 if let Ok(conn) = db_conn_clone.try_lock() {
-                                                    let _ = db::insert_limit_order(&conn, "SELL", token, &format!("PNL {}%", limit_pnl), limit_tip, limit_prio);
+                                                    if let Ok(id) = db::insert_limit_order(&conn, "SELL", token, &format!("PNL {}%", limit_pnl), limit_tip, limit_prio, 0.0) {
+                                                        db_id = id;
+                                                    }
                                                 }
                                                 let client_opt = st.aura_client.clone();
                                                 let db_conn_for_err = st.db_conn.clone();
@@ -597,13 +661,27 @@ async fn main() {
                                                         let tip_lam = (limit_tip * 1e9) as u64;
                                                         let prio_lam = (limit_prio * 1e9) as u64;
 
-                                                        let pnl_f64 = limit_pnl.parse::<f64>().unwrap_or(100.0);
-                                                        let pnl_scaled = ((1.0 + pnl_f64 / 100.0) * 1_000_000f64) as u64;
-                                                        let profit_perc = fastnum::UD128::from(pnl_scaled) / fastnum::UD128::from(1_000_000u64);
-
                                                         let slippage_f64 = sell_slippage.replace("%", "").trim().parse::<f64>().unwrap_or(90.0);
                                                         let slippage_scaled = (slippage_f64 / 100.0 * 1_000_000.0) as u64;
                                                         let slippage_val = fastnum::UD128::from(slippage_scaled) / fastnum::UD128::from(1_000_000u64);
+
+                                                        // Parse target menggunakan unified parser (support PNL, McAp, Price, %)
+                                                        let sol_price = fetch_sol_price_usd().await.unwrap_or(0.0);
+                                                        let aura_target = parse_target_str_to_aura(&limit_pnl, sol_price, "SELL");
+                                                        let aura_target = match aura_target {
+                                                            Some(t) => t,
+                                                            None => {
+                                                                // Fallback ke PNL jika parse gagal
+                                                                let pnl_f64 = limit_pnl.replace("%", "").trim().parse::<f64>().unwrap_or(100.0);
+                                                                let pnl_scaled = ((1.0 + pnl_f64 / 100.0) * 1_000_000f64) as u64;
+                                                                let profit_perc = fastnum::UD128::from(pnl_scaled) / fastnum::UD128::from(1_000_000u64);
+                                                                Target::Profit {
+                                                                    init_profit_perc: profit_perc,
+                                                                    recalced_profit: None,
+                                                                    direction: Direction::Above,
+                                                                }
+                                                            }
+                                                        };
 
                                                         let api_order = ApiLimitOrder {
                                                             state: OrderState::Api {
@@ -615,11 +693,7 @@ async fn main() {
                                                                 slippage: slippage_val,
                                                                 tip: decisol::Lamports::from(tip_lam),
                                                                 fee: decisol::Lamports::from(prio_lam),
-                                                                target: Target::Profit {
-                                                                    init_profit_perc: profit_perc,
-                                                                    recalced_profit: None,
-                                                                    direction: Direction::Above,
-                                                                },
+                                                                target: aura_target,
                                                                 amount: SwapAmount::SellPerc { amount: fastnum::udec128!(1) },
                                                                 procs: TxnProcessors {
                                                                     jito_validators: false,
@@ -651,7 +725,23 @@ async fn main() {
                                                                 slot_latency: 0,
                                                             },
                                                             trigger: OrderEventTrigger::Immediate,
-                                                            wallet: mint_addr,
+                                                            wallet: {
+                                                                let mut trade_client = client.aura();
+                                                                match trade_client.fetch_full_wallet_info((), tonic::Request::new(aura_api_client::types::FetchFullWalletsInfoReq {})).await {
+                                                                    Ok(res) => {
+                                                                        if let Some(w) = res.into_inner().wallets.get(0).cloned() {
+                                                                            w
+                                                                        } else {
+                                                                            error!("[Auto Limit] Gagal menemukan wallet. Menggunakan default (bisa gagal).");
+                                                                            solana_address::Address::default()
+                                                                        }
+                                                                    }
+                                                                    Err(e) => {
+                                                                        error!("[Auto Limit] Gagal fetch wallet dari API: {}", e.message());
+                                                                        solana_address::Address::default()
+                                                                    }
+                                                                }
+                                                            },
                                                         };
 
                                                         let req = tonic::Request::new(UpdateTokenLimitOrders {
@@ -666,9 +756,14 @@ async fn main() {
                                                         };
 
                                                         match client.limit_orders().place_limit_orders((), req).await {
-                                                            Ok(_) => {
+                                                            Ok(resp) => {
+                                                                if let Some(aura_id) = resp.into_inner().ids.get(0).copied().map(|x| x.0) {
+                                                                    if let Ok(conn) = db_conn_for_err.try_lock() {
+                                                                        let _ = crate::db::update_aura_order_id(&conn, db_id, aura_id);
+                                                                    }
+                                                                }
                                                                 let auto_text = format!(
-                                                                    "🤖 *Auto Limit Sell Ditempatkan ke Aura!*\n\n🏦 Token: `{}`\n🎯 Target PNL: {}%\n⚡ Tip: {} SOL\n⛽ P.Fee: {} SOL\n📋 Order ID: #{}\n\n_Bot akan otomatis menjual ketika target terpenuhi._",
+                                                                    "🤖 *Auto Limit Sell Ditempatkan ke Aura!*\n\n🏦 Token: `{}`\n🎯 Target: {}\n⚡ Tip: {} SOL\n⛽ P.Fee: {} SOL\n📋 Order ID: #{}\n\n_Bot akan otomatis menjual ketika target terpenuhi._",
                                                                     short, limit_pnl, limit_tip, limit_prio, order_id
                                                                 );
                                                                 for chat in &chats {
@@ -775,18 +870,30 @@ async fn main() {
 
 // ─── Keyboard Builders ────────────────────────────────────────────────────────
 
-fn make_main_menu_keyboard() -> InlineKeyboardMarkup {
-    InlineKeyboardMarkup::new(vec![
-        vec![
-            InlineKeyboardButton::callback("🔄 Swap Sell", "menu_swapsell"),
-            InlineKeyboardButton::callback("🤖 Auto Limit Order", "menu_autolimit"),
-        ],
-        vec![
-            InlineKeyboardButton::callback("📋 Limit Order History", "menu_history"),
-            InlineKeyboardButton::callback("⚙️ Limit Order Setup", "menu_lo_setup"),
-        ],
-        vec![InlineKeyboardButton::callback("📜 Limit Order Logs", "menu_lo_logs")],
-    ])
+fn make_main_menu_keyboard(st: &BotState) -> InlineKeyboardMarkup {
+    let mut rows = Vec::new();
+    if let Some(token) = &st.bought_token {
+        let short = if token.len() >= 10 {
+            format!("{}...{}", &token[..6], &token[token.len()-4..])
+        } else {
+            token.clone()
+        };
+        rows.push(vec![
+            InlineKeyboardButton::callback(format!("🔴 Swap Sell Konfirmasi ({})", short), "show_swap_panel"),
+        ]);
+    }
+    rows.push(vec![
+        InlineKeyboardButton::callback("🔄 Swap Sell", "menu_swapsell"),
+        InlineKeyboardButton::callback("🤖 Auto Limit Order", "menu_autolimit"),
+    ]);
+    rows.push(vec![
+        InlineKeyboardButton::callback("📋 Limit Order History", "menu_history"),
+        InlineKeyboardButton::callback("⚙️ Limit Order Setup", "menu_lo_setup"),
+    ]);
+    rows.push(vec![
+        InlineKeyboardButton::callback("📜 Limit Order Logs", "menu_lo_logs"),
+    ]);
+    InlineKeyboardMarkup::new(rows)
 }
 
 fn make_swapsell_keyboard(st: &BotState) -> InlineKeyboardMarkup {
@@ -828,7 +935,7 @@ fn make_autolimit_keyboard(st: &BotState) -> InlineKeyboardMarkup {
             InlineKeyboardButton::callback("💰 100.0%", "none"),
         ],
         vec![InlineKeyboardButton::callback(
-            format!("🎯 Target PNL | {}", st.limit_target_pnl),
+            format!("🎯 Target | {}", format_target_display(&st.limit_target_pnl)),
             "edit_auto_pnl",
         )],
         vec![InlineKeyboardButton::callback("<< Back", "menu_main")],
@@ -923,10 +1030,106 @@ fn format_price_short(price_str: &str) -> String {
     price_str.to_string()
 }
 
-/// Format target unified: detect apakah mcap, price, atau persen
+/// Parse target string ke Aura Target enum. Membutuhkan sol_price_usd untuk konversi harga USD.
+fn parse_target_str_to_aura(
+    target_str: &str,
+    sol_price_usd: f64,
+    order_type: &str,
+) -> Option<aura_api_client::types::Target> {
+    use aura_api_client::types::{Direction, Target};
+    let s = target_str.trim();
+    let lower = s.to_lowercase();
+    
+    let default_dir = if order_type.eq_ignore_ascii_case("SELL") { Direction::Above } else { Direction::Below };
+
+    // PNL: format "PNL 60%" / "60%pnl" / "70%pnl" → Target::Profit
+    if lower.contains("pnl") {
+        let num_part: String = s.chars().filter(|&c| c == '-' || c == '.' || c.is_ascii_digit()).collect();
+        if let Ok(pnl_f64) = num_part.parse::<f64>() {
+            let mult = (1.0 + pnl_f64 / 100.0).max(0.0);
+            let pnl_scaled = (mult * 1_000_000f64) as u64;
+            let profit_perc = fastnum::UD128::from(pnl_scaled) / fastnum::UD128::from(1_000_000u64);
+            let direction = if pnl_f64 < 0.0 { Direction::Below } else { Direction::Above };
+            return Some(Target::Profit {
+                init_profit_perc: profit_perc,
+                recalced_profit: None,
+                direction,
+            });
+        }
+        return None;
+    }
+
+    if s.contains('%') {
+        // PricePerc: e.g. "-20%" beli kalau harga turun 20%, "80%" naik 80%
+        let num_part: String = s.chars().filter(|&c| c == '-' || c == '.' || c.is_ascii_digit()).collect();
+        if let Ok(perc_f64) = num_part.parse::<f64>() {
+            let mult = (1.0 + perc_f64 / 100.0).max(0.0);
+            let scaled = (mult * 1_000_000.0) as u64;
+            let price_perc = fastnum::UD128::from(scaled) / fastnum::UD128::from(1_000_000u64);
+            let direction = if perc_f64 < 0.0 { Direction::Below } else { Direction::Above };
+            return Some(Target::PricePerc { price_perc, price: None, direction });
+        }
+    } else if lower.contains("mcap") || lower.contains("cap") || lower.contains('k') || lower.contains('m') {
+        // Mcap target (USD): e.g. "100K mcap", "11M mcap", "2.35M mcap", "100000 mcap"
+        let num_str: String = s.chars().filter(|&c| c == '.' || c.is_ascii_digit()).collect();
+        let multiplier: f64 = if lower.contains('k') { 1_000.0 }
+            else if lower.contains('m') { 1_000_000.0 }
+            else { 1.0 };
+        if let Ok(val) = num_str.parse::<f64>() {
+            let mcap_val = val * multiplier;
+            let scaled = (mcap_val * 1_000_000.0) as u64;
+            let mcap_ud128 = fastnum::UD128::from(scaled) / fastnum::UD128::from(1_000_000u64);
+            return Some(Target::Mcap { mcap: mcap_ud128, price: None, direction: default_dir });
+        }
+    } else {
+        // Price USD (atau SOL per token)
+        let stripped = s.trim_start_matches('$').trim_end_matches('$').trim();
+        if let Ok(price_usd) = stripped.parse::<f64>() {
+            if price_usd > 0.0 && sol_price_usd > 0.0 {
+                let price_in_sol = price_usd / sol_price_usd;
+                let scale: u64 = 1_000_000_000_000;
+                let scaled = (price_in_sol * scale as f64) as u64;
+                let price_ud128 = fastnum::UD128::from(scaled) / fastnum::UD128::from(scale);
+                return Some(Target::Price { price: price_ud128, direction: default_dir });
+            }
+        }
+    }
+    None
+}
+
+/// Fetch harga SOL dalam USD dari Binance API (fallback dari Jupiter yang sedang error 404)
+/// Return Some(price) jika berhasil, None jika gagal.
+async fn fetch_sol_price_usd() -> Option<f64> {
+    let url = "https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT";
+    match reqwest::get(url).await {
+        Ok(resp) => {
+            if let Ok(json) = resp.json::<serde_json::Value>().await {
+                if let Some(price_str) = json["price"].as_str() {
+                    if let Ok(price) = price_str.parse::<f64>() {
+                        info!("[SOL Price] Fetched from Binance: {} USD", price);
+                        return Some(price);
+                    }
+                }
+            }
+            error!("[SOL Price] Gagal parse respons Binance API");
+            None
+        }
+        Err(e) => {
+            error!("[SOL Price] Gagal fetch Binance API: {}", e);
+            None
+        }
+    }
+}
+
+/// Format target unified: detect apakah mcap, price, persen, atau PNL
 fn format_target_display(target: &str) -> String {
     let s = target.trim();
     let lower = s.to_lowercase();
+
+    // PNL
+    if lower.contains("pnl") {
+        return s.to_string();
+    }
 
     // Persen change: mengandung '%'
     if s.contains('%') {
@@ -961,25 +1164,26 @@ fn to_subscript(n: usize) -> String {
 }
 
 /// Parse input target universal dari user:
-/// - McAp: "100000 mcap" | "30K Mcap" | "11M mcap" | "2.35M mcap"
-/// - Price USD: "0.001$" | "$1" | "0.000005$"
-/// - Persen: "80%" | "-20%" | "%80"
-/// Mengembalikan (target_normalized, display_label) atau None jika tidak valid
+/// - McAp: `100K mcap` | `11M mcap` | `2.35M mcap` | `100000 mcap`
+/// - Price: `0.000005$` | `$1` | `0.001$`
+/// - Persen: `80%` | `-20%`
+/// - Pnl : `70%pnl` | `pnl70%` | `60%pnl`
+/// Mengembalikan target_normalized atau None jika tidak valid
 fn parse_target_input(input: &str) -> Option<String> {
     let s = input.trim();
     let lower = s.to_lowercase();
 
+    // PNL: format "70%pnl" | "pnl70%" | "60%pnl" | "pnl60%" | "70pnl%" | "pnl 70%" | "70% pnl"
+    if lower.contains("pnl") {
+        let num_part: String = s.chars().filter(|&c| c == '-' || c == '.' || c.is_ascii_digit()).collect();
+        if let Ok(val) = num_part.parse::<f64>() {
+            return Some(format!("PNL {}%", val));
+        }
+        return None;
+    }
+
     // Persen: mengandung '%'
     if lower.contains('%') {
-        // normalize: hilangkan spasi, pastikan % ada di akhir atau awal
-        let clean = s.replace('%', "").trim().to_string();
-        if let Ok(val) = clean.parse::<f64>() {
-            if val == val { // valid number
-                // kembalikan dengan tanda % di akhir
-                return Some(format!("{}%", val));
-            }
-        }
-        // Coba handle format "-20%" atau "80%"
         let num_part: String = s.chars().filter(|&c| c == '-' || c == '.' || c.is_ascii_digit()).collect();
         if let Ok(val) = num_part.parse::<f64>() {
             return Some(format!("{}%", val));
@@ -987,25 +1191,25 @@ fn parse_target_input(input: &str) -> Option<String> {
         return None;
     }
 
-    // Price USD: mengandung '$' atau bisa diparse sebagai angka kecil/besar
+    // Price USD: mengandung '$'
     let stripped_dollar = s.trim_start_matches('$').trim_end_matches('$').trim();
     if s.contains('$') {
         if let Ok(val) = stripped_dollar.parse::<f64>() {
             if val > 0.0 {
-                return Some(format!("{}", val));
+                return Some(format!("{}$", stripped_dollar));
             }
         }
         return None;
     }
 
-    // McAp: mengandung "mcap", "k", "m", dsb
+    // McAp: mengandung "mcap", "cap"
     if lower.contains("mcap") || lower.contains("cap") {
         return Some(s.to_string());
     }
 
-    // Angka dengan suffix K/M untuk mcap
+    // Angka dengan suffix K/M untuk mcap: "100k", "11m", "2.35m"
     if lower.ends_with('k') || lower.ends_with('m') {
-        return Some(s.to_string());
+        return Some(format!("{} mcap", s));
     }
 
     // Coba parse sebagai angka murni: jika < 1 → price, jika besar → mcap
@@ -1013,10 +1217,10 @@ fn parse_target_input(input: &str) -> Option<String> {
         if val <= 0.0 { return None; }
         if val < 100.0 {
             // Kemungkinan price USD
-            return Some(format!("{}", val));
+            return Some(format!("{}$", val));
         } else {
             // Kemungkinan mcap (angka besar)
-            return Some(format!("{} Mcap", val));
+            return Some(format!("{} mcap", val));
         }
     }
 
@@ -1024,19 +1228,7 @@ fn parse_target_input(input: &str) -> Option<String> {
 }
 
 
-fn make_order_inline_keyboard(id: i64, st: &BotState) -> InlineKeyboardMarkup {
-    let mut current_tip = 0.0;
-    let mut current_prio = 0.0;
-    
-    if let Ok(conn) = st.db_conn.try_lock() {
-        if let Some(orders) = db::load_limit_orders(&conn).ok() {
-            if let Some(o) = orders.iter().find(|o| o.id == id) {
-                current_tip = o.tip_fee;
-                current_prio = o.prio_fee;
-            }
-        }
-    }
-
+fn make_order_inline_keyboard(id: i64, is_buy: bool, current_tip: f64, current_prio: f64, st: &BotState) -> InlineKeyboardMarkup {
     let mut p0 = format!("Kecil\nT:{} P:{}", st.preset_kecil_tip, st.preset_kecil_prio);
     let mut p1 = format!("Sedang\nT:{} P:{}", st.preset_sedang_tip, st.preset_sedang_prio);
     let mut p2 = format!("Besar\nT:{} P:{}", st.preset_besar_tip, st.preset_besar_prio);
@@ -1053,16 +1245,31 @@ fn make_order_inline_keyboard(id: i64, st: &BotState) -> InlineKeyboardMarkup {
         p3 = format!("✅ Mega\nT:{} P:{}", st.preset_mega_tip, st.preset_mega_prio);
     }
 
-    InlineKeyboardMarkup::new(vec![
+    let mut rows = vec![
         vec![
             InlineKeyboardButton::callback(p0, format!("hist_preset_0_{}", id)),
             InlineKeyboardButton::callback(p1, format!("hist_preset_1_{}", id)),
             InlineKeyboardButton::callback(p2, format!("hist_preset_2_{}", id)),
             InlineKeyboardButton::callback(p3, format!("hist_preset_3_{}", id)),
         ],
-        vec![InlineKeyboardButton::callback("🎯 TARGET", format!("edit_hist_target_{}", id))],
-        vec![InlineKeyboardButton::callback("🗑 HAPUS", format!("delete_order_{}", id))],
-    ])
+    ];
+
+    if is_buy {
+        rows.push(vec![
+            InlineKeyboardButton::callback("🎯 TARGET", format!("edit_hist_target_{}", id)),
+            InlineKeyboardButton::callback("💰 AMOUNT", format!("edit_hist_amount_{}", id)),
+        ]);
+    } else {
+        rows.push(vec![
+            InlineKeyboardButton::callback("🎯 TARGET", format!("edit_hist_target_{}", id)),
+        ]);
+    }
+
+    rows.push(vec![
+        InlineKeyboardButton::callback("🗑 HAPUS", format!("delete_order_{}", id)),
+    ]);
+
+    InlineKeyboardMarkup::new(rows)
 }
 
 fn make_setup_keyboard(st: &BotState) -> InlineKeyboardMarkup {
@@ -1102,7 +1309,7 @@ fn order_detail_text(o: &LimitOrder) -> String {
 
 
 fn make_order_detail_keyboard(o: &LimitOrder, st: &BotState) -> InlineKeyboardMarkup {
-    make_order_inline_keyboard(o.id as i64, st)
+    make_order_inline_keyboard(o.id as i64, true, o.tip_fee, o.prio_fee, st)
 }
 
 fn parse_number(text: &str) -> Option<f64> {
@@ -1128,8 +1335,9 @@ async fn answer_command(
             st.limiter.until_ready().await;
             st.active_chats.insert(msg.chat.id);
             let mode = if st.mode == AppMode::Mainnet { "MAINNET" } else { "SIMULASI" };
+            let kb = make_main_menu_keyboard(&st);
             bot.send_message(msg.chat.id, format!("👋 **Selamat datang!**\nMode: `{}`\n\nPilih menu atau **Paste Address Token** untuk Limit Buy.", mode))
-                .reply_markup(make_main_menu_keyboard()).await?;
+                .reply_markup(kb).await?;
         }
         Command::ModeSimulasi => {
             state.lock().await.mode = AppMode::Simulation;
@@ -1140,6 +1348,12 @@ async fn answer_command(
             bot.send_message(msg.chat.id, "⚠️ Mode **MAINNET** aktif!").await?;
         }
         Command::SimulateBuy => {
+            {
+                let mut st = state.lock().await;
+                st.bought_token = Some("AURA_SIMULATED_TOKEN".to_string());
+                st.active_token = Some("AURA_SIMULATED_TOKEN".to_string());
+                st.save_db();
+            }
             bot.send_message(msg.chat.id, "🟢 **Limit Buy Terpicu!**\nToken: $AURA\nHarga Beli: $0.15")
                 .reply_markup(InlineKeyboardMarkup::new(vec![
                     vec![InlineKeyboardButton::callback("🔴 Confirm Swap Sell", "execute_swap_sell")],
@@ -1151,6 +1365,8 @@ async fn answer_command(
             {
                 let mut st = state.lock().await;
                 st.swap_panel_msgs.clear();
+                st.bought_token = None;
+                st.save_db();
             }
             bot.send_message(msg.chat.id, "🧹 Layar dibersihkan.\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n✅ Selesai.").await?;
         }
@@ -1324,17 +1540,174 @@ async fn handle_text_message(
                     .reply_markup(make_autolimit_keyboard(&st)).await?;
             }
             EditField::AutoPnl => {
-                st.limit_target_pnl = lower.replace("%pnl", "%").trim().to_uppercase();
+                if let Some(target) = parse_target_input(text_trim) {
+                    st.limit_target_pnl = target;
+                } else {
+                    st.limit_target_pnl = format!("PNL {}%", text_trim.replace("%", "").trim());
+                }
                 st.edit_field = EditField::None;
-                bot.send_message(chat_id, format!("Target PNL Auto Limit diubah ke {}", st.limit_target_pnl))
+                bot.send_message(chat_id, format!("Target Auto Limit diubah ke {}", format_target_display(&st.limit_target_pnl)))
                     .reply_markup(make_autolimit_keyboard(&st)).await?;
             }
             EditField::HistAmount(id) => {
                 if let Some(val) = parse_number(&lower) {
-                    if let Some(o) = st.orders.iter_mut().find(|o| o.id == id) { o.amount_usd = val; }
-                    st.edit_field = EditField::None;
-                    if let Some(o) = st.orders.iter().find(|o| o.id == id).cloned() {
-                        bot.send_message(chat_id, order_detail_text(&o)).reply_markup(make_order_detail_keyboard(&o, &st)).await?;
+                    if val > 0.0 {
+                        let mut update_token = String::new();
+                        let mut update_aura_oid: Option<i64> = None;
+                        let mut update_tip = 0.0f64;
+                        let mut update_prio = 0.0f64;
+                        let mut update_order_type = String::new();
+                        let mut update_target = String::new();
+                        let update_result = if let Ok(conn) = st.db_conn.try_lock() {
+                            let orders = db::load_limit_orders(&conn).unwrap_or_default();
+                            if let Some(pos) = orders.iter().position(|o| o.id == id) {
+                                let o = &orders[pos];
+                                let display_num = pos + 1;
+                                let _ = db::update_limit_order_amount(&conn, id, val);
+                                update_token = o.token.clone();
+                                update_aura_oid = o.aura_order_id;
+                                update_tip = o.tip_fee;
+                                update_prio = o.prio_fee;
+                                update_order_type = o.order_type.clone();
+                                update_target = o.target.clone();
+                                let short_token = if o.token.len() >= 10 {
+                                    format!("{}...{}", &o.token[..6], &o.token[o.token.len()-4..])
+                                } else {
+                                    o.token.clone()
+                                };
+                                let is_buy = o.order_type.eq_ignore_ascii_case("BUY");
+                                let amount_str = if is_buy {
+                                    format!("\n💰 Amount | {:.2} USD", val)
+                                } else {
+                                    format!("\n💰 Amount | {:.2} SOL", val)
+                                };
+                                Some(format!(
+                                    "#{} LIMIT ORDER | {}\nToken: {}{}\n🎯 Target | {}\n⚡ T:{} SOL ⛽ P:{} SOL",
+                                    display_num, o.order_type, short_token, amount_str, format_target_display(&o.target), o.tip_fee, o.prio_fee
+                                ))
+                            } else { None }
+                        } else { None };
+                        st.edit_field = EditField::None;
+
+                        // Sync update ke Aura gRPC
+                        if let Some(client) = st.aura_client.clone() {
+                            use aura_api_client::types::{
+                                ApiLimitOrder, ApiOrders, OrderEventTrigger, OrderId,
+                                OrderState, RawOrder, SwapAmount, TxnProcessors,
+                                UpdateTokenLimitOrders, UserNonceStrategy,
+                            };
+                            use std::str::FromStr;
+                            let target_c = update_target.clone();
+                            let slippage_str = st.sell_slippage.clone();
+                            let bot_clone = bot.clone();
+                            let update_order_type_c = update_order_type.clone();
+                            if let Ok(mint) = solana_address::Address::from_str(&update_token) {
+                                let slippage_f64 = slippage_str.replace("%", "").trim().parse::<f64>().unwrap_or(95.0);
+                                let slippage_scaled = (slippage_f64 / 100.0 * 1_000_000.0) as u64;
+                                let slippage_val = fastnum::UD128::from(slippage_scaled) / fastnum::UD128::from(1_000_000u64);
+                                let tip_lam = (update_tip * 1e9) as u64;
+                                let prio_lam = (update_prio * 1e9) as u64;
+                                let db_conn_clone = st.db_conn.clone();
+                                tokio::spawn(async move {
+                                    let sol_price = fetch_sol_price_usd().await.unwrap_or(0.0);
+                                    if let Some(aura_target) = parse_target_str_to_aura(&target_c, sol_price, &update_order_type_c) {
+                                        let wallet = {
+                                            let mut tc = client.aura();
+                                            match tc.fetch_full_wallet_info((), tonic::Request::new(aura_api_client::types::FetchFullWalletsInfoReq {})).await {
+                                                Ok(r) => r.into_inner().wallets.get(0).cloned().unwrap_or_default(),
+                                                Err(_) => solana_address::Address::default(),
+                                            }
+                                        };
+                                        
+                                        let swap_amount = if update_order_type_c.eq_ignore_ascii_case("BUY") {
+                                            let amt_sol = if sol_price > 0.0 { val / sol_price } else { val / 150.0 };
+                                            let lamports = (amt_sol * 1e9) as u64;
+                                            SwapAmount::Buy(decisol::QuoteLamports::Lamports(decisol::Lamports::from(lamports)))
+                                        } else {
+                                            SwapAmount::SellPerc { amount: fastnum::udec128!(1) }
+                                        };
+
+                                        let api_order = ApiLimitOrder {
+                                            state: OrderState::Api {
+                                                id: None,
+                                                expire_dur: None,
+                                                activate_dur: None,
+                                            },
+                                            order: RawOrder {
+                                                slippage: slippage_val,
+                                                tip: decisol::Lamports::from(tip_lam),
+                                                fee: decisol::Lamports::from(prio_lam),
+                                                target: aura_target,
+                                                amount: swap_amount,
+                                                procs: TxnProcessors {
+                                                    jito_validators: false,
+                                                    jito_bundled: false,
+                                                    aura: true,
+                                                    bloxroute: false,
+                                                    nozomi: false,
+                                                    next_block: false,
+                                                    slot0: false,
+                                                    astra: false,
+                                                    block_razor: false,
+                                                    node1: false,
+                                                    tpu_penetrator: false,
+                                                    helius: true,
+                                                    stellium: true,
+                                                    soyas: true,
+                                                    falcon: true,
+                                                    raiden: true,
+                                                    circular: true,
+                                                    flash_block: true,
+                                                    moon: true,
+                                                    blocksprint: true,
+                                                    aura_revert: false,
+                                                    landx: true,
+                                                    manka: true,
+                                                    blockrush: true,
+                                                },
+                                                nonce: UserNonceStrategy::Hybrid,
+                                                slot_latency: 0,
+                                            },
+                                            trigger: OrderEventTrigger::Immediate,
+                                            wallet,
+                                        };
+                                        
+                                        // Delete old order if existed
+                                        if let Some(a_id) = update_aura_oid {
+                                            let del_req = tonic::Request::new(aura_api_client::types::DeleteOrders {
+                                                mint,
+                                                all: false,
+                                                ids: vec![OrderId(a_id)],
+                                            });
+                                            let _ = client.limit_orders().delete_limit_orders((), del_req).await;
+                                        }
+
+                                        let req = tonic::Request::new(UpdateTokenLimitOrders {
+                                            mint,
+                                            orders: ApiOrders { orders: vec![api_order] },
+                                        });
+                                        match client.limit_orders().place_limit_orders((), req).await {
+                                            Ok(resp) => {
+                                                if let Some(new_a_id) = resp.into_inner().ids.get(0).copied().map(|x| x.0) {
+                                                    if let Ok(conn) = db_conn_clone.try_lock() {
+                                                        let _ = crate::db::update_aura_order_id(&conn, id, new_a_id);
+                                                    }
+                                                }
+                                                info!("[Edit Amount] Berhasil update dan sync order #{} ke Aura gRPC", id);
+                                            }
+                                            Err(e) => {
+                                                let _ = bot_clone.send_message(chat_id, format!("⚠️ Update amount lokal berhasil, tapi gagal sync ke Aura: {}", e.message())).await;
+                                            }
+                                        }
+                                    }
+                                });
+                            }
+                        }
+
+                        if let Some(txt) = update_result {
+                            let is_buy = update_order_type.eq_ignore_ascii_case("BUY");
+                            bot.send_message(chat_id, txt).reply_markup(make_order_inline_keyboard(id, is_buy, update_tip, update_prio, &st)).await?;
+                        }
                     }
                 }
             }
@@ -1366,26 +1739,165 @@ async fn handle_text_message(
             EditField::HistTarget(id) => {
                 // Validasi dan normalisasi target input
                 let normalized = parse_target_input(text_trim).unwrap_or_else(|| text_trim.to_string());
+                let mut update_token = String::new();
+                let mut update_aura_oid: Option<i64> = None;
+                let mut update_tip = 0.0f64;
+                let mut update_prio = 0.0f64;
+                let mut update_order_type = String::new();
+                let mut update_amount_sol = 0.0f64;
                 let update_result = if let Ok(conn) = st.db_conn.try_lock() {
                     let orders = db::load_limit_orders(&conn).unwrap_or_default();
                     if let Some(pos) = orders.iter().position(|o| o.id == id) {
                         let o = &orders[pos];
                         let display_num = pos + 1;
                         let _ = db::update_limit_order(&conn, id, &normalized, o.tip_fee, o.prio_fee);
+                        update_token = o.token.clone();
+                        update_aura_oid = o.aura_order_id;
+                        update_tip = o.tip_fee;
+                        update_prio = o.prio_fee;
+                        update_order_type = o.order_type.clone();
+                        update_amount_sol = o.amount_sol;
                         let short_token = if o.token.len() >= 10 {
                             format!("{}...{}", &o.token[..6], &o.token[o.token.len()-4..])
                         } else {
                             o.token.clone()
                         };
+                        let is_buy = o.order_type.eq_ignore_ascii_case("BUY");
+                        let amount_str = if o.amount_sol > 0.0 {
+                            if is_buy {
+                                format!("\n💰 Amount | {:.2} USD", o.amount_sol)
+                            } else {
+                                format!("\n💰 Amount | {:.2} SOL", o.amount_sol)
+                            }
+                        } else {
+                            String::new()
+                        };
                         Some(format!(
-                            "#{} LIMIT ORDER | {}\nToken: {}\n🎯 Target | {}\n⚡ T:{} SOL ⛽ P:{} SOL",
-                            display_num, o.order_type, short_token, format_target_display(&normalized), o.tip_fee, o.prio_fee
+                            "#{} LIMIT ORDER | {}\nToken: {}{}\n🎯 Target | {}\n⚡ T:{} SOL ⛽ P:{} SOL",
+                            display_num, o.order_type, short_token, amount_str, format_target_display(&normalized), o.tip_fee, o.prio_fee
                         ))
                     } else { None }
                 } else { None };
                 st.edit_field = EditField::None;
+
+                // Sync update ke Aura gRPC
+                if let Some(client) = st.aura_client.clone() {
+                    use aura_api_client::types::{
+                        ApiLimitOrder, ApiOrders, OrderEventTrigger, OrderId,
+                        OrderState, RawOrder, SwapAmount, TxnProcessors,
+                        UpdateTokenLimitOrders, UserNonceStrategy,
+                    };
+                    use std::str::FromStr;
+                    let normalized_c = normalized.clone();
+                    let slippage_str = st.sell_slippage.clone();
+                    let bot_clone = bot.clone();
+                    let update_order_type_c = update_order_type.clone();
+                    if let Ok(mint) = solana_address::Address::from_str(&update_token) {
+                        let slippage_f64 = slippage_str.replace("%", "").trim().parse::<f64>().unwrap_or(95.0);
+                        let slippage_scaled = (slippage_f64 / 100.0 * 1_000_000.0) as u64;
+                        let slippage_val = fastnum::UD128::from(slippage_scaled) / fastnum::UD128::from(1_000_000u64);
+                        let tip_lam = (update_tip * 1e9) as u64;
+                        let prio_lam = (update_prio * 1e9) as u64;
+                        let db_conn_clone = st.db_conn.clone();
+                        tokio::spawn(async move {
+                            let sol_price = fetch_sol_price_usd().await.unwrap_or(0.0);
+                            if let Some(aura_target) = parse_target_str_to_aura(&normalized_c, sol_price, &update_order_type_c) {
+                                let wallet = {
+                                    let mut tc = client.aura();
+                                    match tc.fetch_full_wallet_info((), tonic::Request::new(aura_api_client::types::FetchFullWalletsInfoReq {})).await {
+                                        Ok(r) => r.into_inner().wallets.get(0).cloned().unwrap_or_default(),
+                                        Err(_) => solana_address::Address::default(),
+                                    }
+                                };
+                                
+                                let swap_amount = if update_order_type_c.eq_ignore_ascii_case("BUY") {
+                                    let amt_sol = if sol_price > 0.0 { update_amount_sol / sol_price } else { update_amount_sol / 150.0 };
+                                    let lamports = (amt_sol * 1e9) as u64;
+                                    SwapAmount::Buy(decisol::QuoteLamports::Lamports(decisol::Lamports::from(lamports)))
+                                } else {
+                                    SwapAmount::SellPerc { amount: fastnum::udec128!(1) }
+                                };
+
+                                let api_order = ApiLimitOrder {
+                                    state: OrderState::Api {
+                                        id: None, // New order ID will be assigned
+                                        expire_dur: None,
+                                        activate_dur: None,
+                                    },
+                                    order: RawOrder {
+                                        slippage: slippage_val,
+                                        tip: decisol::Lamports::from(tip_lam),
+                                        fee: decisol::Lamports::from(prio_lam),
+                                        target: aura_target,
+                                        amount: swap_amount,
+                                        procs: TxnProcessors {
+                                            jito_validators: false,
+                                            jito_bundled: false,
+                                            aura: true,
+                                            bloxroute: false,
+                                            nozomi: false,
+                                            next_block: false,
+                                            slot0: false,
+                                            astra: false,
+                                            block_razor: false,
+                                            node1: false,
+                                            tpu_penetrator: false,
+                                            helius: true,
+                                            stellium: true,
+                                            soyas: true,
+                                            falcon: true,
+                                            raiden: true,
+                                            circular: true,
+                                            flash_block: true,
+                                            moon: true,
+                                            blocksprint: true,
+                                            aura_revert: false,
+                                            landx: true,
+                                            manka: true,
+                                            blockrush: true,
+                                        },
+                                        nonce: UserNonceStrategy::Hybrid,
+                                        slot_latency: 0,
+                                    },
+                                    trigger: OrderEventTrigger::Immediate,
+                                    wallet,
+                                };
+                                
+                                // Delete old order if existed
+                                if let Some(a_id) = update_aura_oid {
+                                    let del_req = tonic::Request::new(aura_api_client::types::DeleteOrders {
+                                        mint,
+                                        all: false,
+                                        ids: vec![OrderId(a_id)],
+                                    });
+                                    let _ = client.limit_orders().delete_limit_orders((), del_req).await;
+                                }
+
+                                let req = tonic::Request::new(UpdateTokenLimitOrders {
+                                    mint,
+                                    orders: ApiOrders { orders: vec![api_order] },
+                                });
+                                match client.limit_orders().place_limit_orders((), req).await {
+                                    Ok(resp) => {
+                                        if let Some(new_a_id) = resp.into_inner().ids.get(0).copied().map(|x| x.0) {
+                                            if let Ok(conn) = db_conn_clone.try_lock() {
+                                                let _ = crate::db::update_aura_order_id(&conn, id, new_a_id);
+                                            }
+                                        }
+                                        info!("[Edit Target] Berhasil update target dan sync order #{} ke Aura gRPC", id);
+                                    }
+                                    Err(e) => {
+                                        let _ = bot_clone.send_message(chat_id, format!("⚠️ Update target lokal berhasil, tapi gagal sync ke Aura: {}", e.message())).await;
+                                    }
+                                }
+                            }
+                        });
+                    }
+                }
+
                 if let Some(txt) = update_result {
-                    bot.send_message(chat_id, txt).reply_markup(make_order_inline_keyboard(id, &st)).await?;
+                    let is_buy = update_order_type.eq_ignore_ascii_case("BUY");
+                    bot.send_message(chat_id, txt).reply_markup(make_order_inline_keyboard(id, is_buy, update_tip, update_prio, &st)).await?;
                 }
             }
             EditField::SetupPresetTip(idx) => {
@@ -1502,10 +2014,47 @@ async fn handle_callback(
         // Prefix routing for history order view & delete
         if data.starts_with("delete_order_") {
             let id: i64 = data.trim_start_matches("delete_order_").parse().unwrap_or(0);
+            
+            let mut aura_order_id = None;
+            let mut order_token = String::new();
+            let mut order_type = String::new();
+            
             if let Ok(conn) = st.db_conn.try_lock() {
+                if let Ok(order) = crate::db::get_limit_order(&conn, id) {
+                    aura_order_id = order.aura_order_id;
+                    order_token = order.token;
+                    order_type = order.order_type;
+                }
                 let _ = db::delete_limit_order(&conn, id);
             }
-            bot.edit_message_text(chat_id, msg_id, "Order dihapus.").await?;
+
+            if let Some(client) = st.aura_client.clone() {
+                use std::str::FromStr;
+                if let Ok(mint) = solana_address::Address::from_str(&order_token) {
+                    let req = if let Some(a_id) = aura_order_id {
+                        tonic::Request::new(aura_api_client::types::DeleteOrders {
+                            mint,
+                            all: false,
+                            ids: vec![aura_api_client::types::OrderId(a_id)],
+                        })
+                    } else {
+                        tonic::Request::new(aura_api_client::types::DeleteOrders {
+                            mint,
+                            all: true,
+                            ids: vec![],
+                        })
+                    };
+                    tokio::spawn(async move {
+                        let res = client.limit_orders().delete_limit_orders((), req).await;
+                        match res {
+                            Ok(_) => info!("Berhasil menghapus order dari Aura gRPC"),
+                            Err(e) => info!("Gagal menghapus order dari Aura gRPC: {}", e.message()),
+                        }
+                    });
+                }
+            }
+
+            bot.edit_message_text(chat_id, msg_id, format!("✅ {} #{} berhasil dihapus dari database lokal & Aura gRPC.", order_type, id)).await?;
             bot.answer_callback_query(q.id.clone()).await?;
             return Ok(());
         }
@@ -1536,11 +2085,136 @@ async fn handle_callback(
                             o.token.clone()
                         };
                         let target_display = format_target_display(&o.target);
+                        let is_buy = o.order_type.eq_ignore_ascii_case("BUY");
+                        let amount_str = if is_buy && o.amount_sol > 0.0 {
+                            format!("\n💰 Amount | {:.2} USD", o.amount_sol)
+                        } else if !is_buy && o.amount_sol > 0.0 {
+                            format!("\n💰 Amount | {:.2} SOL", o.amount_sol)
+                        } else {
+                            String::new()
+                        };
                         let text = format!(
-                            "#{} LIMIT ORDER | {}\nToken: {}\n🎯 Target | {}\n⚡ T:{} SOL ⛽ P:{} SOL",
-                            display_num, o.order_type, short_token, target_display, tip, prio
+                            "#{} LIMIT ORDER | {}\nToken: {}{}\n🎯 Target | {}\n⚡ T:{} SOL ⛽ P:{} SOL",
+                            display_num, o.order_type, short_token, amount_str, target_display, tip, prio
                         );
-                        bot.edit_message_text(chat_id, msg_id, text).reply_markup(make_order_inline_keyboard(o.id, &st)).await?;
+                        bot.edit_message_text(chat_id, msg_id, text).reply_markup(make_order_inline_keyboard(o.id, is_buy, tip, prio, &st)).await?;
+
+                        // Sync tip/prio update ke Aura gRPC jika ada aura_order_id
+                        if let Some(a_id) = o.aura_order_id {
+                            if let Some(client) = st.aura_client.clone() {
+                                use aura_api_client::types::{
+                                    ApiLimitOrder, ApiOrders, OrderEventTrigger, OrderId,
+                                    OrderState, RawOrder, SwapAmount, TxnProcessors,
+                                    UpdateTokenLimitOrders, UserNonceStrategy,
+                                };
+                                use std::str::FromStr;
+                                let target_clone = o.target.clone();
+                                let token_clone = o.token.clone();
+                                let order_type_clone = o.order_type.clone();
+                                let amount_sol = o.amount_sol;
+                                let slippage_str = st.sell_slippage.clone();
+                                let bot_clone = bot.clone();
+                                if let Ok(mint) = solana_address::Address::from_str(&token_clone) {
+                                    let slippage_f64 = slippage_str.replace("%", "").trim().parse::<f64>().unwrap_or(95.0);
+                                    let slippage_scaled = (slippage_f64 / 100.0 * 1_000_000.0) as u64;
+                                    let slippage_val = fastnum::UD128::from(slippage_scaled) / fastnum::UD128::from(1_000_000u64);
+                                    let tip_lam = (tip * 1e9) as u64;
+                                    let prio_lam = (prio * 1e9) as u64;
+                                    let db_conn_clone = st.db_conn.clone();
+                                    tokio::spawn(async move {
+                                        let sol_price = fetch_sol_price_usd().await.unwrap_or(0.0);
+                                        if let Some(aura_target) = parse_target_str_to_aura(&target_clone, sol_price, &order_type_clone) {
+                                            let wallet = {
+                                                let mut tc = client.aura();
+                                                match tc.fetch_full_wallet_info((), tonic::Request::new(aura_api_client::types::FetchFullWalletsInfoReq {})).await {
+                                                    Ok(r) => r.into_inner().wallets.get(0).cloned().unwrap_or_default(),
+                                                    Err(_) => solana_address::Address::default(),
+                                                }
+                                            };
+                                            
+                                            let swap_amount = if order_type_clone.eq_ignore_ascii_case("BUY") {
+                                                let amt_sol = amount_sol / sol_price;
+                                                let lamports = (amt_sol * 1e9) as u64;
+                                                SwapAmount::Buy(decisol::QuoteLamports::Lamports(decisol::Lamports::from(lamports)))
+                                            } else {
+                                                SwapAmount::SellPerc { amount: fastnum::udec128!(1) }
+                                            };
+
+                                            let api_order = ApiLimitOrder {
+                                                state: OrderState::Api {
+                                                    id: None, // New ID will be assigned
+                                                    expire_dur: None,
+                                                    activate_dur: None,
+                                                },
+                                                order: RawOrder {
+                                                    slippage: slippage_val,
+                                                    tip: decisol::Lamports::from(tip_lam),
+                                                    fee: decisol::Lamports::from(prio_lam),
+                                                    target: aura_target,
+                                                    amount: swap_amount,
+                                                    procs: TxnProcessors {
+                                                        jito_validators: false,
+                                                        jito_bundled: false,
+                                                        aura: true,
+                                                        bloxroute: false,
+                                                        nozomi: false,
+                                                        next_block: false,
+                                                        slot0: false,
+                                                        astra: false,
+                                                        block_razor: false,
+                                                        node1: false,
+                                                        tpu_penetrator: false,
+                                                        helius: true,
+                                                        stellium: true,
+                                                        soyas: true,
+                                                        falcon: true,
+                                                        raiden: true,
+                                                        circular: true,
+                                                        flash_block: true,
+                                                        moon: true,
+                                                        blocksprint: true,
+                                                        aura_revert: false,
+                                                        landx: true,
+                                                        manka: true,
+                                                        blockrush: true,
+                                                    },
+                                                    nonce: UserNonceStrategy::Hybrid,
+                                                    slot_latency: 0,
+                                                },
+                                                trigger: OrderEventTrigger::Immediate,
+                                                wallet,
+                                            };
+                                            
+                                            // Delete old order
+                                            let del_req = tonic::Request::new(aura_api_client::types::DeleteOrders {
+                                                mint,
+                                                all: false,
+                                                ids: vec![OrderId(a_id)],
+                                            });
+                                            let _ = client.limit_orders().delete_limit_orders((), del_req).await;
+
+                                            let req = tonic::Request::new(UpdateTokenLimitOrders {
+                                                mint,
+                                                orders: ApiOrders { orders: vec![api_order] },
+                                            });
+                                            match client.limit_orders().place_limit_orders((), req).await {
+                                                Ok(resp) => {
+                                                    if let Some(new_a_id) = resp.into_inner().ids.get(0).copied().map(|x| x.0) {
+                                                        if let Ok(conn) = db_conn_clone.try_lock() {
+                                                            let _ = crate::db::update_aura_order_id(&conn, order_id, new_a_id);
+                                                        }
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    let _ = bot_clone.send_message(chat_id, format!("⚠️ Update lokal berhasil, tapi gagal sync ke Aura: {}", e.message())).await;
+                                                }
+                                            }
+                                        }
+                                    });
+                                }
+                            }
+                        }
+
                         return Ok(());
                     }
                 }
@@ -1555,8 +2229,17 @@ async fn handle_callback(
                 "🎯 Ketik target baru:\n\n\
                 • McAp: `100K mcap` | `11M mcap` | `2.35M mcap`\n\
                 • Price: `0.000005$` | `$1`\n\
-                • Persen: `80%` | `-20%`"
+                • Persen: `80%` | `-20%`\n\
+                • Pnl : `70%pnl` | `pnl70%`"
             ).await?;
+            return Ok(());
+        }
+
+        if data.starts_with("edit_hist_amount_") {
+            let id: i64 = data.trim_start_matches("edit_hist_amount_").parse().unwrap_or(0);
+            st.edit_field = EditField::HistAmount(id);
+            bot.answer_callback_query(q.id.clone()).text("Menunggu input amount...").await?;
+            bot.send_message(chat_id, "💰 Ketik jumlah pembelian baru dalam USD (contoh: `5` atau `10.5`):").await?;
             return Ok(());
         }
 
@@ -1613,7 +2296,18 @@ async fn handle_callback(
         // Exact match routing
         match data.as_str() {
             "menu_main" => {
-                bot.edit_message_text(chat_id, msg_id, "👋 **Menu Utama**").reply_markup(make_main_menu_keyboard()).await?;
+                let kb = make_main_menu_keyboard(&st);
+                bot.edit_message_text(chat_id, msg_id, "👋 **Menu Utama**").reply_markup(kb).await?;
+                bot.answer_callback_query(q.id.clone()).await?;
+            }
+            "show_swap_panel" => {
+                let kb = InlineKeyboardMarkup::new(vec![
+                    vec![InlineKeyboardButton::callback("🔴 Confirm Swap Sell", "execute_swap_sell")],
+                    vec![InlineKeyboardButton::callback("🔄 Refresh PNL", "refresh_pnl")],
+                ]);
+                let token_display = if let Some(t) = &st.bought_token { t.clone() } else { "Token aktif".to_string() };
+                bot.send_message(chat_id, format!("🟢 **Panel Swap Sell (Konfirmasi)**\nToken: {}", token_display))
+                    .reply_markup(kb).await?;
                 bot.answer_callback_query(q.id.clone()).await?;
             }
             "menu_swapsell" => {
@@ -1626,9 +2320,15 @@ async fn handle_callback(
                     let mut pnl_text = format!("Token: `{}`\nPNL: 0.00%\nAmount SOL: 0", token);
                     if token != "Tidak ada token" {
                         if let Some(client) = client_opt {
-                            let req = tonic::Request::new(aura_api_client::types::TokenPositionsUiReq { mint: None });
+                            let start_time = std::time::Instant::now();
+                            let mint_addr = token.parse::<solana_address::Address>().ok();
+                            let req = tonic::Request::new(aura_api_client::types::TokenPositionsUiReq { mint: mint_addr });
+                            
                             if let Ok(resp) = client.aura().get_token_positions_ui((), req).await {
+                                let elapsed = start_time.elapsed();
                                 let ui = resp.into_inner();
+                                
+                                let mut found = false;
                                 for pos in ui.positions {
                                     let mint_str = format!("{:?}", pos.mint);
                                     if mint_str.contains(&token) {
@@ -1638,9 +2338,14 @@ async fn handle_callback(
                                             "0.00".to_string()
                                         };
                                         let amount_sol = format!("{}", pos.quote_value);
-                                        pnl_text = format!("Token: `{}`\nPNL: {}%\nAmount SOL: {}", token, pnl_str, amount_sol);
+                                        pnl_text = format!("Token: `{}`\nPNL: {}%\nAmount SOL: {}\n⏱️ Latency: {:?}", token, pnl_str, amount_sol, elapsed);
+                                        found = true;
                                         break;
                                     }
+                                }
+                                
+                                if !found {
+                                    pnl_text = format!("Token: `{}`\nPNL: 0.00%\nAmount SOL: 0\n⏱️ Latency: {:?}", token, elapsed);
                                 }
                             }
                         }
@@ -1669,9 +2374,15 @@ async fn handle_callback(
                     let mut pnl_text = format!("Token: `{}`\nPNL: 0.00%\nAmount SOL: 0", token);
                     if token != "Tidak ada token" {
                         if let Some(client) = client_opt {
-                            let req = tonic::Request::new(aura_api_client::types::TokenPositionsUiReq { mint: None });
+                            let start_time = std::time::Instant::now();
+                            let mint_addr = token.parse::<solana_address::Address>().ok();
+                            let req = tonic::Request::new(aura_api_client::types::TokenPositionsUiReq { mint: mint_addr });
+                            
                             if let Ok(resp) = client.aura().get_token_positions_ui((), req).await {
+                                let elapsed = start_time.elapsed();
                                 let ui = resp.into_inner();
+                                
+                                let mut found = false;
                                 for pos in ui.positions {
                                     let mint_str = format!("{:?}", pos.mint);
                                     if mint_str.contains(&token) {
@@ -1681,9 +2392,14 @@ async fn handle_callback(
                                             "0.00".to_string()
                                         };
                                         let amount_sol = format!("{}", pos.quote_value);
-                                        pnl_text = format!("Token: `{}`\nPNL: {}%\nAmount SOL: {}", token, pnl_str, amount_sol);
+                                        pnl_text = format!("Token: `{}`\nPNL: {}%\nAmount SOL: {}\n⏱️ Latency: {:?}", token, pnl_str, amount_sol, elapsed);
+                                        found = true;
                                         break;
                                     }
+                                }
+                                
+                                if !found {
+                                    pnl_text = format!("Token: `{}`\nPNL: 0.00%\nAmount SOL: 0\n⏱️ Latency: {:?}", token, elapsed);
                                 }
                             }
                         }
@@ -1774,8 +2490,14 @@ async fn handle_callback(
             }
             "edit_auto_pnl" => {
                 st.edit_field = EditField::AutoPnl;
-                bot.answer_callback_query(q.id.clone()).text("Menunggu input target PNL...").await?;
-                bot.send_message(chat_id, "✏️ Ketik Target PNL baru (contoh: 100%)").await?;
+                bot.answer_callback_query(q.id.clone()).text("Aim & Slay 🌞 Ketik target...").await?;
+                bot.send_message(chat_id,
+                    "🎯 Ketik target baru:\n\n\
+                    • McAp: `100K mcap` | `11M mcap` | `2.35M mcap`\n\
+                    • Price: `0.000005$` | `$1`\n\
+                    • Persen: `80%` | `-20%`\n\
+                    • Pnl : `70%pnl` | `pnl70%`"
+                ).await?;
             }
             // Buy Limit Edits
             "edit_buy_amount" => {
@@ -1787,14 +2509,11 @@ async fn handle_callback(
                 st.edit_field = EditField::BuyTarget;
                 bot.answer_callback_query(q.id.clone()).text("Aim & Slay 🌞 Ketik target...").await?;
                 bot.send_message(chat_id,
-                    "🎯 *Aim \\& Slay* 🌞\n\
-                    Plug in your numbers\\. Your set \\- your rules\\.\n\n\
-                    〽️ *Market Cap in USD*\n\
-                    `100000 mcap` \\| `30K Mcap` \\| `11M mcap` \\| `2\\.35M mcap`\n\n\
-                    💸 *Price in USD*\n\
-                    `0\\.001$` \\| `$1` \\| `0\\.0000005$`\n\n\
-                    💹 *Price Percentage Change*\n\
-                    `80%` \\| `\\-20%` \\| `%80`"
+                    "🎯 Ketik target baru:\n\n\
+                    • McAp: `100K mcap` | `11M mcap` | `2.35M mcap`\n\
+                    • Price: `0.000005$` | `$1`\n\
+                    • Persen: `80%` | `-20%`\n\
+                    • Pnl : `70%pnl` | `pnl70%`"
                 ).await?;
             }
             "edit_buy_tip" => {
@@ -1808,24 +2527,246 @@ async fn handle_callback(
                 bot.send_message(chat_id, "✏️ Ketik nilai P.Fee baru (contoh: 0.005)").await?;
             }
             "place_limit_buy" => {
-                if let Some(token) = &st.active_token {
-                    let target = st.buy_target.clone();
+                if let Some(token) = st.active_token.clone() {
+                    let target_str = st.buy_target.clone();
+                    let buy_sol = st.buy_amount_usd; // field menyimpan SOL amount
+                    let tip_fee = st.buy_tip_fee;
+                    let prio_fee = st.buy_prio_fee;
+                    let order_id = st.next_order_id;
+
                     let o = LimitOrder {
-                        id: st.next_order_id,
+                        id: order_id,
                         token: token.clone(),
-                        amount_usd: st.buy_amount_usd,
-                        target: target.clone(),
-                        tip_fee: st.buy_tip_fee,
-                        prio_fee: st.buy_prio_fee,
+                        amount_usd: buy_sol,
+                        target: target_str.clone(),
+                        tip_fee,
+                        prio_fee,
+                        aura_order_id: None,
                     };
                     // Save to SQLite
+                    let mut db_id = 0;
                     if let Ok(conn) = st.db_conn.try_lock() {
-                        let _ = db::insert_limit_order(&conn, "BUY", token, &target, st.buy_tip_fee, st.buy_prio_fee);
+                        if let Ok(id) = db::insert_limit_order(&conn, "BUY", &token, &target_str, tip_fee, prio_fee, buy_sol) {
+                            db_id = id;
+                        }
                     }
                     st.orders.push(o);
                     st.next_order_id += 1;
-                    bot.answer_callback_query(q.id.clone()).text("Order disimpan!").await?;
-                    bot.send_message(chat_id, "🟢 Limit Buy Order disimpan ke History.\n\n📋 Buka *Limit Order History* untuk melihat.").await?;
+
+                    // Kirim ke Aura gRPC API
+                    if let Some(client) = st.aura_client.clone() {
+                        use aura_api_client::types::{
+                            ApiLimitOrder, ApiOrders, Direction, OrderEventTrigger,
+                            OrderState, RawOrder, SwapAmount, Target, TxnProcessors,
+                            UpdateTokenLimitOrders, UserNonceStrategy,
+                        };
+                        use std::str::FromStr;
+
+                        let token_clone = token.clone();
+                        let bot_clone = bot.clone();
+                        let target_display = format_target_display(&target_str);
+                        let slippage_str = st.sell_slippage.clone();
+                        let db_conn = st.db_conn.clone();
+
+                        tokio::spawn(async move {
+                            let Ok(mint_addr) = solana_address::Address::from_str(&token_clone) else {
+                                let _ = bot_clone.send_message(chat_id, "❌ Alamat token tidak valid!").await;
+                                return;
+                            };
+
+                            let tip_lam = (tip_fee * 1e9) as u64;
+                            let prio_lam = (prio_fee * 1e9) as u64;
+
+                            // Fetch SOL price from Binance API (was Jupiter)
+                            let sol_price_usd = match fetch_sol_price_usd().await {
+                                Some(price) => price,
+                                None => {
+                                    let _ = bot_clone.send_message(chat_id, "❌ Gagal mengambil harga SOL dari API (harga saat ini). Batal mengirim order ke Aura.").await;
+                                    return;
+                                }
+                            };
+
+                            // Convert USD amount → lamports using fetched SOL price
+                            let buy_amount_sol = buy_sol / sol_price_usd; // buy_sol is actually buy_amount_usd
+                            let sol_lam = (buy_amount_sol * 1e9) as u64;
+                            let buy_amount = SwapAmount::Buy(decisol::QuoteLamports::Lamports(
+                                decisol::Lamports::from(sol_lam),
+                            ));
+
+                            // Parse target string → Aura Target enum
+                            let aura_target_opt: Option<Target> = {
+                                let s = target_str.trim();
+                                let lower = s.to_lowercase();
+                                if s.contains('%') {
+                                    // PricePerc: misalnya "-20%" berarti beli kalau harga turun 20%
+                                    let num_part: String = s.chars().filter(|&c| c == '-' || c == '.' || c.is_ascii_digit()).collect();
+                                    if let Ok(perc_f64) = num_part.parse::<f64>() {
+                                        let abs_perc = perc_f64.abs();
+                                        let scaled = (abs_perc / 100.0 * 1_000_000.0) as u64;
+                                        let price_perc = fastnum::UD128::from(scaled) / fastnum::UD128::from(1_000_000u64);
+                                        Some(Target::PricePerc { price_perc, price: None, direction: Direction::Below })
+                                    } else {
+                                        None
+                                    }
+                                } else if lower.contains("mcap") || lower.contains("cap") || lower.ends_with('k') || lower.ends_with('m') {
+                                    // Mcap target (dalam USD, Aura terima langsung)
+                                    let num_str = s.replace(|c: char| c.is_alphabetic(), "").trim().to_string();
+                                    let multiplier: f64 = if lower.ends_with('k') { 1_000.0 }
+                                        else if lower.ends_with('m') { 1_000_000.0 }
+                                        else { 1.0 };
+                                    if let Ok(val) = num_str.parse::<f64>() {
+                                        let mcap_val = val * multiplier;
+                                        let scaled = (mcap_val * 1_000_000.0) as u64;
+                                        let mcap_ud128 = fastnum::UD128::from(scaled) / fastnum::UD128::from(1_000_000u64);
+                                        Some(Target::Mcap { mcap: mcap_ud128, price: None, direction: Direction::Below })
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    // Price USD: angka dengan atau tanpa '$'
+                                    // Target::Price di Aura menggunakan harga dalam SOL per token
+                                    // → konversi: price_sol = price_usd / sol_price
+                                    let stripped = s.trim_start_matches('$').trim_end_matches('$').trim();
+                                    if let Ok(price_usd) = stripped.parse::<f64>() {
+                                        if price_usd > 0.0 {
+                                            let price_in_sol = price_usd / sol_price_usd;
+                                            info!(
+                                                "[Limit Buy] Target: {}$ USD, SOL price: {:.2} USD → price in SOL: {:.12}",
+                                                price_usd, sol_price_usd, price_in_sol
+                                            );
+                                            // Scale dengan 1_000_000_000_000 untuk presisi harga micro
+                                            let scale: u64 = 1_000_000_000_000;
+                                            let scaled = (price_in_sol * scale as f64) as u64;
+                                            let price_ud128 = fastnum::UD128::from(scaled) / fastnum::UD128::from(scale);
+                                            Some(Target::Price { price: price_ud128, direction: Direction::Below })
+                                        } else {
+                                            None
+                                        }
+                                    } else {
+                                        None
+                                    }
+                                }
+                            };
+
+                            let Some(aura_target) = aura_target_opt else {
+                                let _ = bot_clone.send_message(chat_id,
+                                    format!("❌ Gagal parse target `{}` ke format Aura. Order disimpan lokal saja.", target_display)
+                                ).await;
+                                return;
+                            };
+
+                            let slippage_f64 = slippage_str.replace("%", "").trim().parse::<f64>().unwrap_or(95.0);
+                            let slippage_scaled = (slippage_f64 / 100.0 * 1_000_000.0) as u64;
+                            let slippage_val = fastnum::UD128::from(slippage_scaled) / fastnum::UD128::from(1_000_000u64);
+
+                            let api_order = ApiLimitOrder {
+                                state: OrderState::Api {
+                                    id: None,
+                                    expire_dur: None,
+                                    activate_dur: None,
+                                },
+                                order: RawOrder {
+                                    slippage: slippage_val,
+                                    tip: decisol::Lamports::from(tip_lam),
+                                    fee: decisol::Lamports::from(prio_lam),
+                                    target: aura_target,
+                                    amount: buy_amount,
+                                    procs: TxnProcessors {
+                                        jito_validators: false,
+                                        jito_bundled: false,
+                                        aura: true,
+                                        bloxroute: false,
+                                        nozomi: false,
+                                        next_block: false,
+                                        slot0: false,
+                                        astra: false,
+                                        block_razor: false,
+                                        node1: false,
+                                        tpu_penetrator: false,
+                                        helius: true,
+                                        stellium: true,
+                                        soyas: true,
+                                        falcon: true,
+                                        raiden: true,
+                                        circular: true,
+                                        flash_block: true,
+                                        moon: true,
+                                        blocksprint: true,
+                                        aura_revert: false,
+                                        landx: true,
+                                        manka: true,
+                                        blockrush: true,
+                                    },
+                                    nonce: UserNonceStrategy::Hybrid,
+                                    slot_latency: 0,
+                                },
+                                trigger: OrderEventTrigger::Immediate,
+                                wallet: {
+                                    let mut trade_client = client.aura();
+                                    match trade_client.fetch_full_wallet_info((), tonic::Request::new(aura_api_client::types::FetchFullWalletsInfoReq {})).await {
+                                        Ok(res) => {
+                                            if let Some(w) = res.into_inner().wallets.get(0).cloned() {
+                                                w
+                                            } else {
+                                                let _ = bot_clone.send_message(chat_id, "❌ Gagal menemukan wallet. Order menggunakan default.").await;
+                                                solana_address::Address::default()
+                                            }
+                                        }
+                                        Err(e) => {
+                                            let _ = bot_clone.send_message(chat_id, format!("❌ Gagal fetch wallet: {}", e.message())).await;
+                                            solana_address::Address::default()
+                                        }
+                                    }
+                                },
+                            };
+
+                            let req = tonic::Request::new(UpdateTokenLimitOrders {
+                                mint: mint_addr,
+                                orders: ApiOrders { orders: vec![api_order] },
+                            });
+
+                            let short = if token_clone.len() >= 10 {
+                                format!("{}...{}", &token_clone[..6], &token_clone[token_clone.len()-4..])
+                            } else {
+                                token_clone.clone()
+                            };
+
+                            match client.limit_orders().place_limit_orders((), req).await {
+                                Ok(resp) => {
+                                    if let Some(aura_id) = resp.into_inner().ids.get(0).copied().map(|x| x.0) {
+                                        if let Ok(conn) = db_conn.try_lock() {
+                                            let _ = crate::db::update_aura_order_id(&conn, db_id, aura_id);
+                                        }
+                                    }
+                                    let text = format!(
+                                        "✅ *Limit Buy Ditempatkan ke Aura!*\n\n\
+                                        🏦 Token: `{}`\n\
+                                        🎯 Target: {}\n\
+                                        💰 Amount: {:.2} USD (≈ {:.4} SOL)\n\
+                                        ⚡ Tip: {} SOL\n\
+                                        ⛽ P.Fee: {} SOL\n\
+                                        📋 Order ID: #{}\n\n\
+                                        _Bot akan otomatis membeli ketika target terpenuhi._",
+                                        short, target_display, buy_sol, buy_amount_sol, tip_fee, prio_fee, order_id
+                                    );
+                                    let _ = bot_clone.send_message(chat_id, text).await;
+                                }
+                                Err(e) => {
+                                    error!("[Limit Buy] Gagal place_limit_orders: {:?}", e);
+                                    let _ = bot_clone.send_message(chat_id,
+                                        format!("❌ Gagal mengirim Limit Buy ke Aura!\n🏦 Token: `{}`\n🔴 Error: {}\n\n_Order sudah disimpan lokal._", short, e.message())
+                                    ).await;
+                                }
+                            }
+                        });
+
+                        bot.answer_callback_query(q.id.clone()).text("⏳ Mengirim order ke Aura...").await?;
+                    } else {
+                        bot.answer_callback_query(q.id.clone()).text("Order disimpan lokal (no gRPC)!").await?;
+                        bot.send_message(chat_id, "⚠️ Koneksi Aura gRPC tidak tersedia. Order disimpan lokal saja.\n\n📋 Buka *Limit Order History* untuk melihat.").await?;
+                    }
+                } else {
+                    bot.answer_callback_query(q.id.clone()).text("Tidak ada token aktif!").await?;
                 }
             }
             "execute_swap_sell" => {
@@ -1839,6 +2780,8 @@ async fn handle_callback(
                         // Ambil daftar panel yg perlu diedit setelah sell berhasil
                         let panel_msgs = st.swap_panel_msgs.clone();
                         st.swap_panel_msgs.clear(); // clear dulu agar tidak diedit ulang
+                        st.bought_token = None; // hapus tombol konfirmasi
+                        st.save_db();
                         
                         tokio::spawn(async move {
                             use aura_api_client::types::{MarketTrade, SwapAmount, UserNonceStrategy, ApiOrders, TradeFilters};
@@ -1923,33 +2866,47 @@ async fn handle_callback(
 }
 
 async fn send_history_orders(bot: &Bot, chat_id: ChatId, st: &BotState) -> ResponseResult<()> {
-    if let Ok(conn) = st.db_conn.try_lock() {
-        let orders = db::load_limit_orders(&conn).unwrap_or_default();
-        if orders.is_empty() {
-            bot.send_message(chat_id, "📭 Belum ada limit order yang aktif.").await?;
+    let orders = {
+        if let Ok(conn) = st.db_conn.try_lock() {
+            db::load_limit_orders(&conn).unwrap_or_default()
         } else {
-            // Numbering ulang dari 1 berdasarkan urutan aktif, bukan DB id
-            for (idx, o) in orders.iter().enumerate() {
-                let display_num = idx + 1;
-                // Format nama token: gunakan 6 char awal ... 4 char akhir
-                let short_token = if o.token.len() >= 10 {
-                    format!("{}...{}", &o.token[..6], &o.token[o.token.len()-4..])
-                } else {
-                    o.token.clone()
-                };
-                // Format target dengan display method
-                let target_display = format_target_display(&o.target);
-                let text = format!(
-                    "#{} LIMIT ORDER | {}\nToken: {}\n🎯 Target | {}\n⚡ T:{} SOL ⛽ P:{} SOL",
-                    display_num, o.order_type, short_token, target_display, o.tip_fee, o.prio_fee
-                );
-                bot.send_message(chat_id, text)
-                    .reply_markup(make_order_inline_keyboard(o.id, st))
-                    .await?;
-            }
+            bot.send_message(chat_id, "❌ Database sedang sibuk, coba lagi.").await?;
+            return Ok(());
         }
+    };
+
+    if orders.is_empty() {
+        bot.send_message(chat_id, "📭 Belum ada limit order yang aktif.").await?;
     } else {
-        bot.send_message(chat_id, "❌ Database sedang sibuk, coba lagi.").await?;
+        // Numbering ulang dari 1 berdasarkan urutan aktif, bukan DB id
+        for (idx, o) in orders.iter().enumerate() {
+            let display_num = idx + 1;
+            // Format nama token: gunakan 6 char awal ... 4 char akhir
+            let short_token = if o.token.len() >= 10 {
+                format!("{}...{}", &o.token[..6], &o.token[o.token.len()-4..])
+            } else {
+                o.token.clone()
+            };
+            // Format target dengan display method
+            let target_display = format_target_display(&o.target);
+            let is_buy = o.order_type.eq_ignore_ascii_case("BUY");
+            let amount_str = if o.amount_sol > 0.0 {
+                if is_buy {
+                    format!("\n💰 Amount | {:.2} USD", o.amount_sol)
+                } else {
+                    format!("\n💰 Amount | {:.2} SOL", o.amount_sol)
+                }
+            } else {
+                String::new()
+            };
+            let text = format!(
+                "#{} LIMIT ORDER | {}\nToken: {}{}\n🎯 Target | {}\n⚡ T:{} SOL ⛽ P:{} SOL",
+                display_num, o.order_type, short_token, amount_str, target_display, o.tip_fee, o.prio_fee
+            );
+            bot.send_message(chat_id, text)
+                .reply_markup(make_order_inline_keyboard(o.id, is_buy, o.tip_fee, o.prio_fee, st))
+                .await?;
+        }
     }
     Ok(())
 }
@@ -1981,4 +2938,57 @@ async fn send_error_logs(bot: &Bot, chat_id: ChatId, st: &BotState) -> ResponseR
         bot.send_message(chat_id, "❌ Database sedang sibuk, coba lagi.").await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aura_api_client::types::Target;
+
+    #[test]
+    fn test_parse_target_inputs() {
+        assert_eq!(parse_target_input("100K mcap"), Some("100K mcap".to_string()));
+        assert_eq!(parse_target_input("11M mcap"), Some("11M mcap".to_string()));
+        assert_eq!(parse_target_input("2.35M mcap"), Some("2.35M mcap".to_string()));
+        assert_eq!(parse_target_input("0.000005$"), Some("0.000005$".to_string()));
+        assert_eq!(parse_target_input("$1"), Some("1$".to_string()));
+        assert_eq!(parse_target_input("80%"), Some("80%".to_string()));
+        assert_eq!(parse_target_input("-20%"), Some("-20%".to_string()));
+        assert_eq!(parse_target_input("70%pnl"), Some("PNL 70%".to_string()));
+        assert_eq!(parse_target_input("pnl70%"), Some("PNL 70%".to_string()));
+        assert_eq!(parse_target_input("60%pnl"), Some("PNL 60%".to_string()));
+    }
+
+    #[test]
+    fn test_parse_target_str_to_aura() {
+        let sol_price = 150.0;
+        
+        // PNL 60% -> Target::Profit with 1.6
+        let t = parse_target_str_to_aura("PNL 60%", sol_price, "SELL");
+        assert!(matches!(t, Some(Target::Profit { .. })));
+
+        // McAp 100K mcap -> Target::Mcap
+        let t = parse_target_str_to_aura("100K mcap", sol_price, "SELL");
+        assert!(matches!(t, Some(Target::Mcap { .. })));
+
+        // McAp 11M mcap -> Target::Mcap
+        let t = parse_target_str_to_aura("11M mcap", sol_price, "SELL");
+        assert!(matches!(t, Some(Target::Mcap { .. })));
+
+        // Price 0.000005$ -> Target::Price
+        let t = parse_target_str_to_aura("0.000005$", sol_price, "BUY");
+        assert!(matches!(t, Some(Target::Price { .. })));
+
+        // Persen 80% -> Target::PricePerc
+        let t = parse_target_str_to_aura("80%", sol_price, "SELL");
+        assert!(matches!(t, Some(Target::PricePerc { .. })));
+    }
+
+    #[test]
+    fn test_parse_number() {
+        assert_eq!(parse_number("5"), Some(5.0));
+        assert_eq!(parse_number("10.5"), Some(10.5));
+        assert_eq!(parse_number("5$"), Some(5.0));
+        assert_eq!(parse_number("0.25 sol"), Some(0.25));
+    }
 }

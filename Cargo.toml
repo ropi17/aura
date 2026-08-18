@@ -2,6 +2,7 @@
 name = "aura_bot"
 version = "0.1.0"
 edition = "2021"
+default-run = "aura_bot"
 
 [dependencies]
 teloxide = { version = "0.12", features = ["macros", "rustls"] }
@@ -19,3 +20,5 @@ fastnum = "0.7.4"
 decisol = { git = "https://github.com/4r33x/decisol", version = "1.0.1" }
 solana-address = "2.7.0"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+serde_json = "1"

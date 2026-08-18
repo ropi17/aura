@@ -23,6 +23,7 @@ pub struct DbSettings {
     pub preset_besar_prio: f64,
     pub preset_mega_tip: f64,
     pub preset_mega_prio: f64,
+    pub bought_token: Option<String>,
 }
 
 impl Default for DbSettings {
@@ -44,6 +45,7 @@ impl Default for DbSettings {
             preset_besar_prio: 0.002,
             preset_mega_tip: 0.005,
             preset_mega_prio: 0.005,
+            bought_token: None,
         }
     }
 }
@@ -60,7 +62,10 @@ pub struct DbLimitOrder {
     pub tip_fee: f64,
     pub prio_fee: f64,
     pub created_at: String,
+    pub aura_order_id: Option<i64>,
+    pub amount_sol: f64, // lamport amount in SOL (for BUY: SOL to spend; for SELL: 0 = 100%)
 }
+
 
 // ─── Error Logs ────────────────────────────────────────────────────────────────
 
@@ -120,7 +125,9 @@ pub fn init_db() -> Result<Connection> {
             target TEXT NOT NULL,
             tip_fee REAL NOT NULL,
             prio_fee REAL NOT NULL,
-            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            aura_order_id INTEGER,
+            amount_sol REAL DEFAULT 0.0
         )",
         [],
     )?;
@@ -137,6 +144,9 @@ pub fn init_db() -> Result<Connection> {
         [],
     )?;
 
+    // Migrations / Ensure columns exist
+    let _ = conn.execute("ALTER TABLE settings ADD COLUMN bought_token TEXT", []);
+
     // Insert default settings row if not present
     let count: i64 = conn.query_row("SELECT count(*) FROM settings WHERE id = 1", [], |row| row.get(0))?;
     if count == 0 {
@@ -145,8 +155,8 @@ pub fn init_db() -> Result<Connection> {
             "INSERT INTO settings (id, auto_limit_active, limit_tip_fee, limit_prio_fee, limit_act_time, limit_target_pnl,
              sell_tip_fee, sell_prio_fee, sell_slippage,
              preset_kecil_tip, preset_kecil_prio, preset_sedang_tip, preset_sedang_prio,
-             preset_besar_tip, preset_besar_prio, preset_mega_tip, preset_mega_prio)
-             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+             preset_besar_tip, preset_besar_prio, preset_mega_tip, preset_mega_prio, bought_token)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 def.auto_limit_active as i32,
                 def.limit_tip_fee,
@@ -164,6 +174,7 @@ pub fn init_db() -> Result<Connection> {
                 def.preset_besar_prio,
                 def.preset_mega_tip,
                 def.preset_mega_prio,
+                def.bought_token,
             ],
         )?;
     }
@@ -178,7 +189,7 @@ pub fn load_settings(conn: &Connection) -> Result<DbSettings> {
         "SELECT auto_limit_active, limit_tip_fee, limit_prio_fee, limit_act_time, limit_target_pnl,
                 sell_tip_fee, sell_prio_fee, sell_slippage,
                 preset_kecil_tip, preset_kecil_prio, preset_sedang_tip, preset_sedang_prio,
-                preset_besar_tip, preset_besar_prio, preset_mega_tip, preset_mega_prio
+                preset_besar_tip, preset_besar_prio, preset_mega_tip, preset_mega_prio, bought_token
          FROM settings WHERE id = 1",
         [],
         |row| {
@@ -199,6 +210,7 @@ pub fn load_settings(conn: &Connection) -> Result<DbSettings> {
                 preset_besar_prio: row.get(13)?,
                 preset_mega_tip: row.get(14)?,
                 preset_mega_prio: row.get(15)?,
+                bought_token: row.get::<_, Option<String>>(16).unwrap_or(None),
             })
         },
     )
@@ -222,7 +234,8 @@ pub fn save_settings(conn: &Connection, set: &DbSettings) -> Result<()> {
             preset_besar_tip = ?13,
             preset_besar_prio = ?14,
             preset_mega_tip = ?15,
-            preset_mega_prio = ?16
+            preset_mega_prio = ?16,
+            bought_token = ?17
          WHERE id = 1",
         params![
             set.auto_limit_active as i32,
@@ -241,6 +254,7 @@ pub fn save_settings(conn: &Connection, set: &DbSettings) -> Result<()> {
             set.preset_besar_prio,
             set.preset_mega_tip,
             set.preset_mega_prio,
+            set.bought_token,
         ],
     )?;
     Ok(())
@@ -268,17 +282,17 @@ pub fn save_chat(conn: &Connection, chat_id: ChatId) -> Result<()> {
 
 // ─── Limit Order History CRUD ─────────────────────────────────────────────────
 
-pub fn insert_limit_order(conn: &Connection, order_type: &str, token: &str, target: &str, tip: f64, prio: f64) -> Result<i64> {
+pub fn insert_limit_order(conn: &Connection, order_type: &str, token: &str, target: &str, tip: f64, prio: f64, amount_sol: f64) -> Result<i64> {
     conn.execute(
-        "INSERT INTO limit_orders (order_type, token, target, tip_fee, prio_fee) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![order_type, token, target, tip, prio],
+        "INSERT INTO limit_orders (order_type, token, target, tip_fee, prio_fee, amount_sol) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![order_type, token, target, tip, prio, amount_sol],
     )?;
     Ok(conn.last_insert_rowid())
 }
 
 pub fn load_limit_orders(conn: &Connection) -> Result<Vec<DbLimitOrder>> {
     let mut stmt = conn.prepare(
-        "SELECT id, order_type, token, target, tip_fee, prio_fee, created_at FROM limit_orders ORDER BY id ASC"
+        "SELECT id, order_type, token, target, tip_fee, prio_fee, created_at, aura_order_id, amount_sol FROM limit_orders ORDER BY id ASC"
     )?;
     let iter = stmt.query_map([], |row| {
         Ok(DbLimitOrder {
@@ -289,6 +303,8 @@ pub fn load_limit_orders(conn: &Connection) -> Result<Vec<DbLimitOrder>> {
             tip_fee: row.get(4)?,
             prio_fee: row.get(5)?,
             created_at: row.get(6)?,
+            aura_order_id: row.get(7)?,
+            amount_sol: row.get::<_, Option<f64>>(8)?.unwrap_or(0.0),
         })
     })?;
     let mut orders = Vec::new();
@@ -300,6 +316,14 @@ pub fn update_limit_order(conn: &Connection, id: i64, target: &str, tip: f64, pr
     conn.execute(
         "UPDATE limit_orders SET target = ?1, tip_fee = ?2, prio_fee = ?3 WHERE id = ?4",
         params![target, tip, prio, id],
+    )?;
+    Ok(())
+}
+
+pub fn update_limit_order_amount(conn: &Connection, id: i64, amount: f64) -> Result<()> {
+    conn.execute(
+        "UPDATE limit_orders SET amount_sol = ?1 WHERE id = ?2",
+        params![amount, id],
     )?;
     Ok(())
 }
@@ -340,4 +364,32 @@ pub fn load_error_logs(conn: &Connection) -> Result<Vec<DbErrorLog>> {
 pub fn clear_error_logs(conn: &Connection) -> Result<()> {
     conn.execute("DELETE FROM error_logs", [])?;
     Ok(())
+}
+
+pub fn update_aura_order_id(conn: &Connection, id: i64, aura_order_id: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE limit_orders SET aura_order_id = ?1 WHERE id = ?2",
+        params![aura_order_id, id],
+    )?;
+    Ok(())
+}
+
+pub fn get_limit_order(conn: &Connection, id: i64) -> Result<DbLimitOrder> {
+    conn.query_row(
+        "SELECT id, order_type, token, target, tip_fee, prio_fee, created_at, aura_order_id, amount_sol FROM limit_orders WHERE id = ?1",
+        params![id],
+        |row| {
+            Ok(DbLimitOrder {
+                id: row.get(0)?,
+                order_type: row.get(1)?,
+                token: row.get(2)?,
+                target: row.get(3)?,
+                tip_fee: row.get(4)?,
+                prio_fee: row.get(5)?,
+                created_at: row.get(6)?,
+                aura_order_id: row.get(7)?,
+                amount_sol: row.get::<_, Option<f64>>(8)?.unwrap_or(0.0),
+            })
+        }
+    )
 }
