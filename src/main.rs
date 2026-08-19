@@ -2875,6 +2875,18 @@ async fn send_history_orders(bot: &Bot, chat_id: ChatId, st: &BotState) -> Respo
         }
     };
 
+    let mut aura_diagnostics = std::collections::HashMap::new();
+    if let Some(client) = &st.aura_client {
+        let req = tonic::Request::new(aura_api_client::client::types::GetLimitOrders);
+        if let Ok(resp) = client.limit_orders().get_limit_orders((), req).await {
+            for api_order in resp.into_inner().orders {
+                if let aura_api_client::client::types::OrderState::Placed { id, left_attempts, status, .. } = &api_order.state {
+                    aura_diagnostics.insert(id.0, (api_order.trigger.clone(), *left_attempts, status.clone()));
+                }
+            }
+        }
+    }
+
     if orders.is_empty() {
         bot.send_message(chat_id, "📭 Belum ada limit order yang aktif.").await?;
     } else {
@@ -2899,9 +2911,38 @@ async fn send_history_orders(bot: &Bot, chat_id: ChatId, st: &BotState) -> Respo
             } else {
                 String::new()
             };
+
+            let mut diagnosa_str = String::new();
+            if let Some(aura_id) = o.aura_order_id {
+                if let Some((trigger, left_attempts, status)) = aura_diagnostics.get(&aura_id) {
+                    let status_str = match status {
+                        aura_api_client::client::types::OrderStatus::Execute => "Execute",
+                        aura_api_client::client::types::OrderStatus::Skip => "Skip",
+                        aura_api_client::client::types::OrderStatus::Remove => "Remove",
+                    };
+                    
+                    diagnosa_str.push_str("\n\n🔍 Diagnosa Aura:");
+                    if !matches!(trigger, aura_api_client::client::types::OrderEventTrigger::Immediate) {
+                        diagnosa_str.push_str(&format!("\n• Status: {} | Attempts: {}\n• Skenario 3: Trigger Non-Immediate. Cek event pemicunya.", status_str, left_attempts));
+                    } else if *left_attempts < 5 && *left_attempts > 0 {
+                        diagnosa_str.push_str(&format!("\n• Status: {} | Attempts: {}\n• Skenario 1: Attempts berkurang. Coba naikkan tip/slippage.", status_str, left_attempts));
+                    } else if *left_attempts == 0 {
+                        diagnosa_str.push_str(&format!("\n• Status: {} | Attempts: {}\n• Skenario 1: Gagal total (attempts habis).", status_str, left_attempts));
+                    } else if matches!(status, aura_api_client::client::types::OrderStatus::Execute) {
+                        diagnosa_str.push_str(&format!("\n• Status: {} | Attempts: {}\n• Skenario 2: Status Execute tapi attempts utuh. Laporkan ke Dev Aura jika target harga sudah kena.", status_str, left_attempts));
+                    } else {
+                        diagnosa_str.push_str(&format!("\n• Status: {} | Attempts: {}", status_str, left_attempts));
+                    }
+                } else {
+                    diagnosa_str.push_str("\n\n🔍 Diagnosa Aura: Order tidak ditemukan di gRPC (Mungkin sudah selesai atau expired).");
+                }
+            } else {
+                diagnosa_str.push_str("\n\n🔍 Diagnosa Aura: Order belum disinkronkan ke Aura gRPC.");
+            }
+
             let text = format!(
-                "#{} LIMIT ORDER | {}\nToken: {}{}\n🎯 Target | {}\n⚡ T:{} SOL ⛽ P:{} SOL",
-                display_num, o.order_type, short_token, amount_str, target_display, o.tip_fee, o.prio_fee
+                "#{} LIMIT ORDER | {}\nToken: {}{}\n🎯 Target | {}\n⚡ T:{} SOL ⛽ P:{} SOL{}",
+                display_num, o.order_type, short_token, amount_str, target_display, o.tip_fee, o.prio_fee, diagnosa_str
             );
             bot.send_message(chat_id, text)
                 .reply_markup(make_order_inline_keyboard(o.id, is_buy, o.tip_fee, o.prio_fee, st))
