@@ -553,7 +553,41 @@ async fn main() {
                                                         _ => (false, None, None),
                                                     }
                                                 }
-                                                TradeStateUpdate::Lost { .. } => (false, None, None),
+                                                TradeStateUpdate::Lost { signatures } => {
+                                                    // Cek apakah salah satu signature ini milik limit order kita
+                                                    for sig in signatures {
+                                                        let sig_str = format!("{}", sig);
+                                                        if let Some((token, aura_id)) = pending_limit_sigs.remove(&sig_str) {
+                                                            info!("[Aura Stream] Limit Order transaksi HILANG (Lost) — bukan Skenario 1. Asumsikan Skenario 2. AuraID={}", aura_id);
+                                                            let err_msg = format!("Skenario 2: Transaksi tidak dieksekusi oleh Aura (Lost/tidak terkirim ke blockchain). AuraID={}", aura_id);
+                                                            let chats = {
+                                                                let st = st_clone.lock().await;
+                                                                st.active_chats.clone()
+                                                            };
+                                                            let db_conn_clone = {
+                                                                let st = st_clone.lock().await;
+                                                                st.db_conn.clone()
+                                                            };
+                                                            let mut local_id = aura_id;
+                                                            if let Ok(conn) = db_conn_clone.try_lock() {
+                                                                if let Ok(orders) = crate::db::load_limit_orders(&conn) {
+                                                                    if let Some(o) = orders.iter().find(|o| o.aura_order_id == Some(aura_id)) {
+                                                                        local_id = o.id;
+                                                                    }
+                                                                }
+                                                                let _ = crate::db::insert_error_log(&conn, local_id, &token, &err_msg);
+                                                            }
+                                                            let notif = format!(
+                                                                "⚠️ *Limit Order Tidak Dieksekusi (Skenario 2)*\n\n🏦 Token: `{}`\n❌ Penyebab: Transaksi tidak berhasil dikirim ke blockchain oleh Aura.\n\n_Kemungkinan: engine Aura gagal mendeteksi harga. Laporkan ke Dev Aura._\n_Log tersimpan di menu 📜 Limit Order Logs._",
+                                                                token
+                                                            );
+                                                            for chat in &chats {
+                                                                let _ = bot_clone.send_message(*chat, &notif).parse_mode(teloxide::types::ParseMode::Markdown).await;
+                                                            }
+                                                        }
+                                                    }
+                                                    (false, None, None)
+                                                }
                                             }
                                         }
                                         _ => (false, None, None),
