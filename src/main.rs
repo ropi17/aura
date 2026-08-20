@@ -181,6 +181,9 @@ struct BotState {
 
     // Token aktif yang dibeli (untuk tombol konfirmasi swap sell)
     bought_token: Option<String>,
+
+    // Mode pembelian: "LIMIT" atau "SWAP"
+    buy_mode: String,
 }
 
 impl BotState {
@@ -324,6 +327,7 @@ async fn main() {
         swap_panel_msgs: Vec::new(),
         processed_signatures: std::collections::HashSet::new(),
         bought_token: loaded_settings.bought_token,
+        buy_mode: "LIMIT".to_string(),
     };
     st.sync_presets();
     let state = Arc::new(Mutex::new(st));
@@ -391,6 +395,7 @@ async fn main() {
                         stream_ready_listener.store(true, Ordering::Relaxed);
                         
                         let mut pending_limit_sigs: std::collections::HashMap<String, (String, i64)> = std::collections::HashMap::new();
+                        let mut pending_swap_sigs: std::collections::HashMap<String, String> = std::collections::HashMap::new();
 
                         while let Some(msg) = stream.next().await {
                             match msg {
@@ -408,61 +413,66 @@ async fn main() {
                                     // ── SELALU log ke server (bukan Telegram) ──
                                     info!("[Aura Stream] {:?}", action);
 
-                                    // ── Deteksi Limit Order Triggered ──
+                                    // ── Deteksi Trade Triggered ──
                                     if let UserAction::TradeEvent(confirm_state) = &action {
-                                        if let ConfirmTradeKind::LimitOrder { token, order } = &confirm_state.confirm_trade_kind {
-                                            let aura_id = if let aura_api_client::types::OrderState::Placed { id, .. } = &order.state { id.0 } else { 0 };
-                                            if aura_id != 0 {
-                                                let token_str = format!("{}", token);
-                                                for sig in &confirm_state.sigs {
-                                                    pending_limit_sigs.insert(format!("{}", sig), (token_str.clone(), aura_id));
+                                        match &confirm_state.confirm_trade_kind {
+                                            ConfirmTradeKind::LimitOrder { token, order } => {
+                                                let aura_id = if let aura_api_client::types::OrderState::Placed { id, .. } = &order.state { id.0 } else { 0 };
+                                                if aura_id != 0 {
+                                                    let token_str = format!("{}", token);
+                                                    for sig in &confirm_state.sigs {
+                                                        pending_limit_sigs.insert(format!("{}", sig), (token_str.clone(), aura_id));
+                                                    }
                                                 }
                                             }
+                                            ConfirmTradeKind::Swap { token, .. } => {
+                                                let token_str = format!("{}", token);
+                                                for sig in &confirm_state.sigs {
+                                                    pending_swap_sigs.insert(format!("{}", sig), token_str.clone());
+                                                }
+                                            }
+                                            _ => {}
                                         }
                                     }
 
                                     // ── Deteksi Transaksi Gagal ──
+                                    // Hanya simpan ke log DB, JANGAN kirim notif ke Telegram
+                                    // Karena engine Aura multi-attempt: gagal 1 attempt bukan berarti order gagal total
                                     if let UserAction::TradeCallback(TradeStateUpdate::Landed { state: TxnConfirmState::Failed { err, .. }, signature }) = &action {
                                         let sig_str = format!("{}", signature);
                                         if let Some((token, aura_id)) = pending_limit_sigs.remove(&sig_str) {
-                                            info!("[Aura Stream] Limit Order Gagal on-chain! AuraID={}, Err={:?}", aura_id, err);
-                                            let mut local_id = aura_id;
+                                            info!("[Aura Stream] Limit Order Gagal on-chain (1 attempt), AuraID={}, Err={:?} — Disimpan ke log saja.", aura_id, err);
+                                            // Bersihkan semua signature lain aura_id ini agar tidak ada notif ganda
+                                            pending_limit_sigs.retain(|_, (_, aid)| *aid != aura_id);
                                             let err_msg = format!("{:?}", err);
-                                            
-                                            // Ambil chat IDs
-                                            let chats = {
-                                                let st = st_clone.lock().await;
-                                                st.active_chats.clone()
-                                            };
-                                            
-                                            let db_conn_clone = {
-                                                let st = st_clone.lock().await;
-                                                st.db_conn.clone()
-                                            };
-                                            if let Ok(conn) = db_conn_clone.try_lock() {
+                                            // Simpan ke DB — akses langsung lewat lock state
+                                            let st = st_clone.lock().await;
+                                            if let Ok(conn) = st.db_conn.try_lock() {
+                                                let mut local_id = aura_id;
                                                 if let Ok(orders) = crate::db::load_limit_orders(&conn) {
                                                     if let Some(o) = orders.iter().find(|o| o.aura_order_id == Some(aura_id)) {
                                                         local_id = o.id;
                                                     }
                                                 }
+                                                // Simpan ke error log DB saja (tidak kirim ke Telegram)
                                                 let _ = crate::db::insert_error_log(&conn, local_id, &token, &err_msg);
                                             }
-                                            
-                                            let err_text = format!("⚠️ *Limit Order Gagal Dieksekusi (Aura)*\n\n🏦 Token: `{}`\n❌ Error: `{}`\n\n_Log telah tersimpan, buka menu 📜 Limit Order Logs untuk detailnya._", token, err_msg);
-                                            for chat in chats {
-                                                let _ = bot_clone.send_message(chat, &err_text).parse_mode(teloxide::types::ParseMode::Markdown).await;
-                                            }
+                                            drop(st);
                                         }
                                     }
 
-                                    // ── Deteksi SELL on-chain (auto limit terpenuhi) ──
+                                    // ── Deteksi SELL on-chain (auto limit / swap manual) ──
                                     // Ini harus dicek SEBELUM BUY agar tidak tertukar
                                     if let UserAction::TradeCallback(TradeStateUpdate::Landed {
-                                        state: TxnConfirmState::Confirmed { trades, .. }, ..
+                                        state: TxnConfirmState::Confirmed { trades, .. }, signature
                                     }) = &action {
                                         let has_sell = trades.iter().any(|t| matches!(t, ParsedTradeUi::Sell { .. }));
                                         if has_sell {
-                                            // Ambil detail sell dari trade pertama yang Sell
+                                            let sig_str = format!("{}", signature);
+                                            let is_limit = pending_limit_sigs.contains_key(&sig_str);
+                                            pending_limit_sigs.remove(&sig_str);
+                                            pending_swap_sigs.remove(&sig_str);
+
                                             let sell_info = trades.iter().find_map(|t| {
                                                 if let ParsedTradeUi::Sell { mint, ticker, quote, pnl, .. } = t {
                                                     Some((format!("{}", mint), ticker.clone(), quote.clone(), pnl.clone()))
@@ -472,7 +482,7 @@ async fn main() {
                                             });
 
                                             if let Some((mint_str, ticker, quote_val, pnl_val)) = sell_info {
-                                                info!("[Aura Stream] Terdeteksi SELL berhasil on-chain! Token={}", mint_str);
+                                                info!("[Aura Stream] Terdeteksi SELL berhasil on-chain! Token={}, is_limit={}", mint_str, is_limit);
 
                                                 let (panel_msgs, chats) = {
                                                     let st = st_clone.lock().await;
@@ -480,15 +490,19 @@ async fn main() {
                                                 };
 
                                                 let pnl_str = pnl_val
-                                                    .map(|p| format!("{:.2}", p))
+                                                    .map(|p| {
+                                                        let p_f64 = format!("{}", p).parse::<f64>().unwrap_or(1.0);
+                                                        format!("{:.2}", (p_f64 - 1.0) * 100.0)
+                                                    })
                                                     .unwrap_or_else(|| "N/A".to_string());
 
-                                                // quote adalah QuoteLamports (lamports token quote / SOL)
-                                                // format sebagai SOL (÷ 1e9)
                                                 let sol_received = {
                                                     let raw: u64 = quote_val.into();
                                                     raw as f64 / 1e9
                                                 };
+
+                                                let sol_price_now = fetch_sol_price_usd().await.unwrap_or(0.0);
+                                                let usd_received = sol_received * sol_price_now;
 
                                                 let ticker_display = if ticker.is_empty() {
                                                     let s = &mint_str;
@@ -497,37 +511,43 @@ async fn main() {
                                                     ticker.clone()
                                                 };
 
-                                                let sold_text = format!(
-                                                    "✅ *Token Terjual via Auto Limit!*\n\n\
-                                                    🏦 Token: `{}` ({})\n\
-                                                    💰 SOL Diterima: `{:.6}` SOL\n\
-                                                    📈 PNL: `{}%`\n\n\
-                                                    _Auto Limit Sell telah dieksekusi otomatis oleh Aura._",
-                                                    ticker_display, mint_str, sol_received, pnl_str
-                                                );
+                                                let sold_text = if is_limit {
+                                                    format!(
+                                                        "✅ *Token Terjual via Auto Limit!*\n\n\
+                                                        🏦 Token: `{}` ({})\n\
+                                                        💰 SOL Diterima: `{:.6}` SOL (${:.2})\n\
+                                                        📈 PNL: `{}%`\n\n\
+                                                        _Auto Limit Sell telah dieksekusi otomatis oleh Aura._",
+                                                        ticker_display, mint_str, sol_received, usd_received, pnl_str
+                                                    )
+                                                } else {
+                                                    format!(
+                                                        "✅ *Terjual via Swap Sell Manual!*\n\n\
+                                                        🏦 Token: `{}` ({})\n\
+                                                        💰 SOL Diterima: `{:.6}` SOL (${:.2})\n\
+                                                        📈 PNL: `{}%`\n\n\
+                                                        _Transaksi swap sell manual berhasil dikonfirmasi di blockchain._",
+                                                        ticker_display, mint_str, sol_received, usd_received, pnl_str
+                                                    )
+                                                };
 
-                                                // Edit semua panel swap sell yang tersimpan
                                                 for (chat_id, msg_id) in &panel_msgs {
                                                     let _ = bot_clone
                                                         .edit_message_text(*chat_id, *msg_id, &sold_text)
                                                         .await;
                                                 }
-
-                                                // Jika tidak ada panel tersimpan, kirim pesan baru
                                                 if panel_msgs.is_empty() {
                                                     for chat in &chats {
                                                         let _ = bot_clone.send_message(*chat, &sold_text).await;
                                                     }
                                                 }
-
-                                                // Clear panel msgs & bought_token setelah terjual
                                                 {
                                                     let mut st = st_clone.lock().await;
                                                     st.swap_panel_msgs.clear();
                                                     st.bought_token = None;
                                                     st.save_db();
                                                 }
-                                                continue; // skip ke event berikutnya
+                                                continue;
                                             }
                                         }
                                     }
@@ -555,35 +575,26 @@ async fn main() {
                                                 }
                                                 TradeStateUpdate::Lost { signatures } => {
                                                     // Cek apakah salah satu signature ini milik limit order kita
+                                                    // JANGAN kirim notif ke Telegram - engine Aura memang multi-attempt
+                                                    // signature yg Lost belum tentu berarti order gagal
                                                     for sig in signatures {
                                                         let sig_str = format!("{}", sig);
                                                         if let Some((token, aura_id)) = pending_limit_sigs.remove(&sig_str) {
-                                                            info!("[Aura Stream] Limit Order transaksi HILANG (Lost) — bukan Skenario 1. Asumsikan Skenario 2. AuraID={}", aura_id);
-                                                            let err_msg = format!("Skenario 2: Transaksi tidak dieksekusi oleh Aura (Lost/tidak terkirim ke blockchain). AuraID={}", aura_id);
-                                                            let chats = {
-                                                                let st = st_clone.lock().await;
-                                                                st.active_chats.clone()
-                                                            };
-                                                            let db_conn_clone = {
-                                                                let st = st_clone.lock().await;
-                                                                st.db_conn.clone()
-                                                            };
-                                                            let mut local_id = aura_id;
-                                                            if let Ok(conn) = db_conn_clone.try_lock() {
+                                                            info!("[Aura Stream] Limit Order sig Lost (multi-attempt normal) AuraID={} — disimpan ke log saja.", aura_id);
+                                                            let err_msg = format!("Signature Lost (multi-attempt): AuraID={}", aura_id);
+                                                            // Simpan ke DB — akses langsung lewat lock state
+                                                            let st_tmp = st_clone.lock().await;
+                                                            if let Ok(conn) = st_tmp.db_conn.try_lock() {
+                                                                let mut local_id = aura_id;
                                                                 if let Ok(orders) = crate::db::load_limit_orders(&conn) {
                                                                     if let Some(o) = orders.iter().find(|o| o.aura_order_id == Some(aura_id)) {
                                                                         local_id = o.id;
                                                                     }
                                                                 }
+                                                                // Simpan ke log DB saja - TIDAK kirim notif ke Telegram
                                                                 let _ = crate::db::insert_error_log(&conn, local_id, &token, &err_msg);
                                                             }
-                                                            let notif = format!(
-                                                                "⚠️ *Limit Order Tidak Dieksekusi (Skenario 2)*\n\n🏦 Token: `{}`\n❌ Penyebab: Transaksi tidak berhasil dikirim ke blockchain oleh Aura.\n\n_Kemungkinan: engine Aura gagal mendeteksi harga. Laporkan ke Dev Aura._\n_Log tersimpan di menu 📜 Limit Order Logs._",
-                                                                token
-                                                            );
-                                                            for chat in &chats {
-                                                                let _ = bot_clone.send_message(*chat, &notif).parse_mode(teloxide::types::ParseMode::Markdown).await;
-                                                            }
+                                                            drop(st_tmp);
                                                         }
                                                     }
                                                     (false, None, None)
@@ -926,6 +937,7 @@ fn make_main_menu_keyboard(st: &BotState) -> InlineKeyboardMarkup {
     ]);
     rows.push(vec![
         InlineKeyboardButton::callback("📜 Limit Order Logs", "menu_lo_logs"),
+        InlineKeyboardButton::callback("💧 Claim Your SOL", "menu_claim_sol"),
     ]);
     InlineKeyboardMarkup::new(rows)
 }
@@ -1025,20 +1037,18 @@ fn make_limitbuy_keyboard(st: &BotState) -> InlineKeyboardMarkup {
 
     // Row Slippage
     rows.push(vec![InlineKeyboardButton::callback("🏄‍♂️ Slippage | 90%", "none")]);
-    // Row Side & Dip
-    rows.push(vec![
-        InlineKeyboardButton::callback("Side | BUY", "none"),
-        InlineKeyboardButton::callback("Dip", "none"),
-    ]);
-    // Row Activation & Amount
-    rows.push(vec![
-        InlineKeyboardButton::callback("Activation | Instant", "none"),
-        InlineKeyboardButton::callback(format!("💰 {:.2} $", st.buy_amount_usd), "edit_buy_amount"),
-    ]);
-    // Row Target (satu tombol unified)
-    rows.push(vec![InlineKeyboardButton::callback(target_label, "edit_buy_target")]);
-    // Row Place Order
-    rows.push(vec![InlineKeyboardButton::callback("📥 Place Order 📥", "place_limit_buy")]);
+    // Row Mode Toggle
+    let mode_label = format!("🔄 Mode | {}", if st.buy_mode == "SWAP" { "Swap" } else { "Limit Order" });
+    rows.push(vec![InlineKeyboardButton::callback(mode_label, "toggle_buy_mode")]);
+    // Row Amount
+    rows.push(vec![InlineKeyboardButton::callback(format!("💰 {:.2} $", st.buy_amount_usd), "edit_buy_amount")]);
+    // Row Target + Execute/Place based on mode
+    if st.buy_mode == "SWAP" {
+        rows.push(vec![InlineKeyboardButton::callback("⚡ Execute Swap ⚡", "place_swap_buy")]);
+    } else {
+        rows.push(vec![InlineKeyboardButton::callback(target_label, "edit_buy_target")]);
+        rows.push(vec![InlineKeyboardButton::callback("📥 Place Order 📥", "place_limit_buy")]);
+    }
     // Row Back
     rows.push(vec![InlineKeyboardButton::callback("<< Back", "menu_main")]);
 
@@ -1300,6 +1310,7 @@ fn make_order_inline_keyboard(id: i64, is_buy: bool, current_tip: f64, current_p
     }
 
     rows.push(vec![
+        InlineKeyboardButton::callback("🔧 Buat ATA", format!("create_ata_{}", id)),
         InlineKeyboardButton::callback("🗑 HAPUS", format!("delete_order_{}", id)),
     ]);
 
@@ -2045,6 +2056,81 @@ async fn handle_callback(
         // Register active chat
         st.active_chats.insert(chat_id);
 
+        if data == "delete_this_message" {
+            let _ = bot.delete_message(chat_id, msg_id).await;
+            bot.answer_callback_query(q.id).await?;
+            return Ok(());
+        }
+
+        if data.starts_with("create_ata_") {
+            let id: i64 = data.trim_start_matches("create_ata_").parse().unwrap_or(0);
+            let mut order_token = String::new();
+            if let Ok(conn) = st.db_conn.try_lock() {
+                if let Ok(order) = crate::db::get_limit_order(&conn, id) {
+                    order_token = order.token;
+                }
+            }
+            if order_token.is_empty() {
+                bot.send_message(chat_id, "❌ Limit order tidak ditemukan.").await?;
+                bot.answer_callback_query(q.id.clone()).await?;
+                return Ok(());
+            }
+
+            if let Some(client) = st.aura_client.clone() {
+                let bot_clone = bot.clone();
+                let token_clone = order_token.clone();
+                let chat_id_clone = chat_id;
+                
+                tokio::spawn(async move {
+                    use aura_api_client::types::{OpenTaRequest, TokenAccountKindUi, FetchFullWalletsInfoReq};
+                    use std::str::FromStr;
+
+                    if let Ok(mint_addr) = solana_address::Address::from_str(&token_clone) {
+                        let wallet_res = client.aura().fetch_full_wallet_info((), tonic::Request::new(FetchFullWalletsInfoReq {})).await;
+                        let wallet = match wallet_res {
+                            Ok(res) => res.into_inner().wallets.get(0).cloned().unwrap_or_default(),
+                            Err(e) => {
+                                let _ = bot_clone.send_message(chat_id_clone, format!("❌ Gagal mengambil info wallet: {}", e.message())).await;
+                                return;
+                            }
+                        };
+
+                        let req = tonic::Request::new(OpenTaRequest {
+                            owner: wallet,
+                            mint: mint_addr,
+                            kind: TokenAccountKindUi::Ata,
+                            is_2022: false,
+                        });
+
+                        match client.utils().open_ta((), req).await {
+                            Ok(resp) => {
+                                let sig = resp.into_inner();
+                                let sig_str = format!("{}", sig);
+                                let solscan_link = format!("https://solscan.io/tx/{}", sig_str);
+                                let success_text = format!("Transaction sent: <a href=\"{}\">{}</a>", solscan_link, sig_str);
+                                let keyboard = teloxide::types::InlineKeyboardMarkup::new(vec![vec![
+                                    teloxide::types::InlineKeyboardButton::callback("Hapus", "delete_this_message")
+                                ]]);
+                                let _ = bot_clone.send_message(chat_id_clone, success_text)
+                                    .parse_mode(teloxide::types::ParseMode::Html)
+                                    .reply_markup(keyboard)
+                                    .await;
+                            }
+                            Err(e) => {
+                                let _ = bot_clone.send_message(chat_id_clone, format!("❌ Gagal membuat ATA: {}", e.message())).await;
+                            }
+                        }
+                    } else {
+                        let _ = bot_clone.send_message(chat_id_clone, "❌ Alamat token tidak valid!").await;
+                    }
+                });
+            } else {
+                bot.send_message(chat_id, "❌ Client Aura gRPC belum terhubung.").await?;
+            }
+            bot.answer_callback_query(q.id.clone()).await?;
+            return Ok(());
+        }
+
         // Prefix routing for history order view & delete
         if data.starts_with("delete_order_") {
             let id: i64 = data.trim_start_matches("delete_order_").parse().unwrap_or(0);
@@ -2334,6 +2420,25 @@ async fn handle_callback(
                 bot.edit_message_text(chat_id, msg_id, "👋 **Menu Utama**").reply_markup(kb).await?;
                 bot.answer_callback_query(q.id.clone()).await?;
             }
+            "menu_claim_sol" => {
+                let text = "💧 *Claim Your SOL*\n\n\
+                *Info Penting:*\n\
+                Secara native di jaringan Solana, Anda **tidak memerlukan layanan eksternal (seperti web pihak ketiga)** untuk mengklaim SOL dari token kosong. Itu adalah fitur bawaan Solana (SPL Token) di mana Anda cukup mengirimkan instruksi `CloseAccount` untuk menghapus ATA kosong dan uang sewa (rent) sebesar ~0.002 SOL akan otomatis kembali ke dompet Anda.\n\n\
+                **Status Bot Saat Ini:**\n\
+                Koneksi Aura gRPC saat ini belum menyediakan fitur/endpoint untuk melakukan `CloseAccount`. Karena bot ini tidak memegang Private Key Anda secara langsung (semua transaksi diamankan melalui Aura API), bot belum bisa menghapus token kosong Anda dari sini.\n\n\
+                *Saran:*\n\
+                Untuk mengklaim SOL Anda saat ini, Anda bisa menggunakan dompet seperti Phantom/Solflare yang memiliki fitur bawaan untuk menghapus akun token spam/kosong, atau menggunakan dApps tepercaya seperti *Sol Incinerator* atau *Step Finance*. Hati-hati dengan situs web pihak ketiga yang tidak resmi!";
+                
+                let kb = teloxide::types::InlineKeyboardMarkup::new(vec![
+                    vec![teloxide::types::InlineKeyboardButton::callback("<< Back", "menu_main")]
+                ]);
+                let _ = bot.edit_message_text(chat_id, msg_id, text)
+                    .parse_mode(teloxide::types::ParseMode::Markdown)
+                    .reply_markup(kb)
+                    .await;
+                bot.answer_callback_query(q.id.clone()).await?;
+            }
+
             "show_swap_panel" => {
                 let kb = InlineKeyboardMarkup::new(vec![
                     vec![InlineKeyboardButton::callback("🔴 Confirm Swap Sell", "execute_swap_sell")],
@@ -2367,12 +2472,17 @@ async fn handle_callback(
                                     let mint_str = format!("{:?}", pos.mint);
                                     if mint_str.contains(&token) {
                                         let pnl_str = if let Some(p) = pos.pnl {
-                                            format!("{:.2}", p)
+                                            let p_f64 = format!("{}", p).parse::<f64>().unwrap_or(1.0);
+                                            let pnl_pct = (p_f64 - 1.0) * 100.0;
+                                            format!("{:.2}", pnl_pct)
                                         } else {
                                             "0.00".to_string()
                                         };
-                                        let amount_sol = format!("{}", pos.quote_value);
-                                        pnl_text = format!("Token: `{}`\nPNL: {}%\nAmount SOL: {}\n⏱️ Latency: {:?}", token, pnl_str, amount_sol, elapsed);
+                                        let raw_lamports: u64 = pos.quote_value.into();
+                                        let sol_val = raw_lamports as f64 / 1e9;
+                                        let sol_price_usd = fetch_sol_price_usd().await.unwrap_or(0.0);
+                                        let usd_val = sol_val * sol_price_usd;
+                                        pnl_text = format!("Token: `{}`\nPNL: {}%\nAmount SOL: {:.6} SOL (${:.2})\n⏱️ Latency: {:?}", token, pnl_str, sol_val, usd_val, elapsed);
                                         found = true;
                                         break;
                                     }
@@ -2421,12 +2531,17 @@ async fn handle_callback(
                                     let mint_str = format!("{:?}", pos.mint);
                                     if mint_str.contains(&token) {
                                         let pnl_str = if let Some(p) = pos.pnl {
-                                            format!("{:.2}", p)
+                                            let p_f64 = format!("{}", p).parse::<f64>().unwrap_or(1.0);
+                                            let pnl_pct = (p_f64 - 1.0) * 100.0;
+                                            format!("{:.2}", pnl_pct)
                                         } else {
                                             "0.00".to_string()
                                         };
-                                        let amount_sol = format!("{}", pos.quote_value);
-                                        pnl_text = format!("Token: `{}`\nPNL: {}%\nAmount SOL: {}\n⏱️ Latency: {:?}", token, pnl_str, amount_sol, elapsed);
+                                        let raw_lamports: u64 = pos.quote_value.into();
+                                        let sol_val = raw_lamports as f64 / 1e9;
+                                        let sol_price_usd = fetch_sol_price_usd().await.unwrap_or(0.0);
+                                        let usd_val = sol_val * sol_price_usd;
+                                        pnl_text = format!("Token: `{}`\nPNL: {}%\nAmount SOL: {:.6} SOL (${:.2})\n⏱️ Latency: {:?}", token, pnl_str, sol_val, usd_val, elapsed);
                                         found = true;
                                         break;
                                     }
@@ -2560,6 +2675,91 @@ async fn handle_callback(
                 bot.answer_callback_query(q.id.clone()).text("Menunggu input p.fee...").await?;
                 bot.send_message(chat_id, "✏️ Ketik nilai P.Fee baru (contoh: 0.005)").await?;
             }
+            "toggle_buy_mode" => {
+                if st.buy_mode == "LIMIT" {
+                    st.buy_mode = "SWAP".to_string();
+                } else {
+                    st.buy_mode = "LIMIT".to_string();
+                }
+                let new_mode = st.buy_mode.clone();
+                bot.answer_callback_query(q.id.clone()).text(format!("Mode diubah ke {}", new_mode)).await?;
+                if st.active_token.is_some() {
+                    send_limitbuy_menu(&bot, chat_id, &st).await?;
+                }
+            }
+            "place_swap_buy" => {
+                if let Some(client) = st.aura_client.clone() {
+                    if let Some(token) = st.active_token.clone() {
+                        let bot_clone = bot.clone();
+                        let tip_fee = st.buy_tip_fee;
+                        let prio_fee = st.buy_prio_fee;
+                        let buy_usd = st.buy_amount_usd;
+                        let chat_id_clone = chat_id;
+                        bot.answer_callback_query(q.id.clone()).text("Memproses Swap Buy...").await?;
+                        tokio::spawn(async move {
+                            use aura_api_client::types::{MarketTrade, SwapAmount, UserNonceStrategy, ApiOrders, TradeFilters};
+                            use std::str::FromStr;
+                            let _ = bot_clone.send_message(chat_id_clone, "⏳ Memproses Swap Buy ke Aura...").await;
+                            match solana_address::Address::from_str(&token) {
+                                Ok(mint_addr) => {
+                                    let tip_lamports = (tip_fee * 1e9) as u64;
+                                    let prio_lamports = (prio_fee * 1e9) as u64;
+                                    let sol_price_usd = fetch_sol_price_usd().await.unwrap_or(0.0);
+                                    if sol_price_usd == 0.0 {
+                                        let _ = bot_clone.send_message(chat_id_clone, "❌ Gagal mendapatkan harga SOL. Coba lagi.").await;
+                                        return;
+                                    }
+                                    let buy_amount_sol = buy_usd / sol_price_usd;
+                                    let sol_lam = (buy_amount_sol * 1e9) as u64;
+                                    let slippage_scaled = (90.0_f64 / 100.0 * 1_000_000.0) as u64;
+                                    let slippage_val = fastnum::UD128::from(slippage_scaled) / fastnum::UD128::from(1_000_000u64);
+                                    let req = tonic::Request::new(MarketTrade {
+                                        wallet: None,
+                                        amount: SwapAmount::Buy(decisol::QuoteLamports::Lamports(decisol::Lamports::from(sol_lam))),
+                                        mint: mint_addr,
+                                        slippage: slippage_val,
+                                        tip: decisol::Lamports::from(tip_lamports),
+                                        priority_fee: decisol::Lamports::from(prio_lamports),
+                                        procs: None,
+                                        nonce: UserNonceStrategy::Hybrid,
+                                        slot_latency: None,
+                                        expire_at: None,
+                                        rpc_nonce: None,
+                                        max_price_impact: None,
+                                        limit_orders: ApiOrders { orders: vec![] },
+                                        filters: TradeFilters { min_mcap: None, max_mcap: None },
+                                    });
+                                    match client.aura().trade((), req).await {
+                                        Ok(_) => {
+                                            let success_text = format!(
+                                                "✅ *Swap Buy Berhasil!*\n\n\
+                                                🏦 Token: `{}`\n\
+                                                💰 Jumlah: ${:.2} ({:.4} SOL)\n\
+                                                ⚡ Tip: {} SOL | ⛽ Prio: {} SOL\n\n\
+                                                _Transaksi telah dikirim ke Aura (Market Swap)._",
+                                                token, buy_usd, buy_amount_sol, tip_fee, prio_fee
+                                            );
+                                            let _ = bot_clone.send_message(chat_id_clone, success_text)
+                                                .parse_mode(teloxide::types::ParseMode::Markdown).await;
+                                        }
+                                        Err(e) => {
+                                            let _ = bot_clone.send_message(chat_id_clone, format!("❌ Swap Buy Gagal: {}", e.message())).await;
+                                        }
+                                    }
+                                }
+                                Err(_) => {
+                                    let _ = bot_clone.send_message(chat_id_clone, "❌ Alamat token tidak valid!").await;
+                                }
+                            }
+                        });
+                    } else {
+                        bot.answer_callback_query(q.id.clone()).text("Pilih token terlebih dahulu").await?;
+                    }
+                } else {
+                    bot.send_message(chat_id, "❌ Client Aura gRPC belum terhubung.").await?;
+                    bot.answer_callback_query(q.id.clone()).await?;
+                }
+            }
             "place_limit_buy" => {
                 if let Some(token) = st.active_token.clone() {
                     let target_str = st.buy_target.clone();
@@ -2601,6 +2801,7 @@ async fn handle_callback(
                         let target_display = format_target_display(&target_str);
                         let slippage_str = st.sell_slippage.clone();
                         let db_conn = st.db_conn.clone();
+                        let state_clone = state.clone();
 
                         tokio::spawn(async move {
                             let Ok(mint_addr) = solana_address::Address::from_str(&token_clone) else {
@@ -2772,18 +2973,10 @@ async fn handle_callback(
                                             let _ = crate::db::update_aura_order_id(&conn, db_id, aura_id);
                                         }
                                     }
-                                    let text = format!(
-                                        "✅ *Limit Buy Ditempatkan ke Aura!*\n\n\
-                                        🏦 Token: `{}`\n\
-                                        🎯 Target: {}\n\
-                                        💰 Amount: {:.2} USD (≈ {:.4} SOL)\n\
-                                        ⚡ Tip: {} SOL\n\
-                                        ⛽ P.Fee: {} SOL\n\
-                                        📋 Order ID: #{}\n\n\
-                                        _Bot akan otomatis membeli ketika target terpenuhi._",
-                                        short, target_display, buy_sol, buy_amount_sol, tip_fee, prio_fee, order_id
-                                    );
-                                    let _ = bot_clone.send_message(chat_id, text).await;
+                                    // Beralih ke History
+                                    let st_ref = state_clone.lock().await;
+                                    let _ = bot_clone.send_message(chat_id, "📋 *Limit Order History*").await;
+                                    let _ = send_history_orders(&bot_clone, chat_id, &st_ref).await;
                                 }
                                 Err(e) => {
                                     error!("[Limit Buy] Gagal place_limit_orders: {:?}", e);
