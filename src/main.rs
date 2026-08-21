@@ -147,7 +147,8 @@ struct BotState {
 
     // Manual Limit Buy Settings (mode pembuatan order baru)
     active_token: Option<String>,
-    buy_amount_usd: f64,
+    buy_amount: f64,
+    buy_currency: String,        // "USD" or "SOL"
     buy_target: String,          // unified target: mcap / price-usd / persen-change
     buy_tip_fee: f64,
     buy_prio_fee: f64,
@@ -315,7 +316,8 @@ async fn main() {
         preset_mega_tip: loaded_settings.preset_mega_tip,
         preset_mega_prio: loaded_settings.preset_mega_prio,
         active_token: None,
-        buy_amount_usd: 2.0,
+        buy_amount: 2.0,
+        buy_currency: "USD".to_string(),
         buy_target: "50 Mcap".to_string(),
         buy_tip_fee: 0.001,
         buy_prio_fee: 0.001,
@@ -1040,8 +1042,12 @@ fn make_limitbuy_keyboard(st: &BotState) -> InlineKeyboardMarkup {
     // Row Mode Toggle
     let mode_label = format!("🔄 Mode | {}", if st.buy_mode == "SWAP" { "Swap" } else { "Limit Order" });
     rows.push(vec![InlineKeyboardButton::callback(mode_label, "toggle_buy_mode")]);
-    // Row Amount
-    rows.push(vec![InlineKeyboardButton::callback(format!("💰 {:.2} $", st.buy_amount_usd), "edit_buy_amount")]);
+    // Row Amount + Currency Toggle
+    let currency_label = if st.buy_currency == "SOL" { "SOL" } else { "$" };
+    rows.push(vec![
+        InlineKeyboardButton::callback(format!("💰 {:.4} {}", st.buy_amount, currency_label), "edit_buy_amount"),
+        InlineKeyboardButton::callback(if st.buy_currency == "SOL" { "🔀 Ganti ke USD" } else { "🔀 Ganti ke SOL" }, "toggle_buy_currency"),
+    ]);
     // Row Target + Execute/Place based on mode
     if st.buy_mode == "SWAP" {
         rows.push(vec![InlineKeyboardButton::callback("⚡ Execute Swap ⚡", "place_swap_buy")]);
@@ -1450,8 +1456,23 @@ async fn handle_text_message(
         // Tangani input berdasarkan field yang sedang diedit
         match st.edit_field.clone() {
             EditField::BuyAmount => {
-                if let Some(val) = parse_number(&lower) {
-                    st.buy_amount_usd = val;
+                let lower_trimmed = lower.trim();
+                let is_sol = lower_trimmed.ends_with("sol");
+                let is_usd = lower_trimmed.ends_with("usd") || lower_trimmed.ends_with("usdt") || lower_trimmed.ends_with("$");
+                
+                let cleaned = lower_trimmed
+                    .replace("sol", "")
+                    .replace("usdt", "")
+                    .replace("usd", "")
+                    .replace("$", "");
+                    
+                if let Some(val) = parse_number(&cleaned) {
+                    st.buy_amount = val;
+                    if is_sol {
+                        st.buy_currency = "SOL".to_string();
+                    } else if is_usd {
+                        st.buy_currency = "USD".to_string();
+                    }
                     st.edit_field = EditField::None;
                     send_limitbuy_menu(&bot, chat_id, &st).await?;
                 }
@@ -2016,9 +2037,18 @@ async fn handle_text_message(
             EditField::None => {
                 // Ignore text if we are not editing anything, 
                 // UN Kecuali fallback global kalau user ngetik "5$" tanpa nge-klik tombol edit Amount dulu (untuk UX lama)
-                if lower.ends_with('$') {
-                    if let Some(val) = parse_number(&lower) {
-                        st.buy_amount_usd = val;
+                if lower.ends_with('$') || lower.ends_with("usd") || lower.ends_with("usdt") {
+                    let cleaned = lower.replace("$", "").replace("usdt", "").replace("usd", "");
+                    if let Some(val) = parse_number(&cleaned) {
+                        st.buy_amount = val;
+                        st.buy_currency = "USD".to_string();
+                        if st.active_token.is_some() { send_limitbuy_menu(&bot, chat_id, &st).await?; }
+                    }
+                } else if lower.ends_with("sol") {
+                    let cleaned = lower.replace("sol", "");
+                    if let Some(val) = parse_number(&cleaned) {
+                        st.buy_amount = val;
+                        st.buy_currency = "SOL".to_string();
                         if st.active_token.is_some() { send_limitbuy_menu(&bot, chat_id, &st).await?; }
                     }
                 } else if lower.contains("mcap") {
@@ -2652,7 +2682,7 @@ async fn handle_callback(
             "edit_buy_amount" => {
                 st.edit_field = EditField::BuyAmount;
                 bot.answer_callback_query(q.id.clone()).text("Menunggu input jumlah...").await?;
-                bot.send_message(chat_id, "✏️ Ketik jumlah USD beli baru (contoh: 5)").await?;
+                bot.send_message(chat_id, "✏️ Ketik jumlah beli baru beserta formatnya (contoh: `10 USD`, `5 USDT`, atau `0.5 SOL`).\n\nJika angka saja, akan menggunakan format yang sedang aktif.").parse_mode(teloxide::types::ParseMode::Markdown).await?;
             }
             "edit_buy_target" => {
                 st.edit_field = EditField::BuyTarget;
@@ -2687,13 +2717,26 @@ async fn handle_callback(
                     send_limitbuy_menu(&bot, chat_id, &st).await?;
                 }
             }
+            "toggle_buy_currency" => {
+                if st.buy_currency == "USD" {
+                    st.buy_currency = "SOL".to_string();
+                } else {
+                    st.buy_currency = "USD".to_string();
+                }
+                let label = st.buy_currency.clone();
+                bot.answer_callback_query(q.id.clone()).text(format!("Format diubah ke {}", label)).await?;
+                if st.active_token.is_some() {
+                    send_limitbuy_menu(&bot, chat_id, &st).await?;
+                }
+            }
             "place_swap_buy" => {
                 if let Some(client) = st.aura_client.clone() {
                     if let Some(token) = st.active_token.clone() {
                         let bot_clone = bot.clone();
                         let tip_fee = st.buy_tip_fee;
                         let prio_fee = st.buy_prio_fee;
-                        let buy_usd = st.buy_amount_usd;
+                        let buy_val = st.buy_amount;
+                        let buy_cur = st.buy_currency.clone();
                         let chat_id_clone = chat_id;
                         bot.answer_callback_query(q.id.clone()).text("Memproses Swap Buy...").await?;
                         tokio::spawn(async move {
@@ -2704,15 +2747,29 @@ async fn handle_callback(
                                 Ok(mint_addr) => {
                                     let tip_lamports = (tip_fee * 1e9) as u64;
                                     let prio_lamports = (prio_fee * 1e9) as u64;
-                                    let sol_price_usd = fetch_sol_price_usd().await.unwrap_or(0.0);
-                                    if sol_price_usd == 0.0 {
-                                        let _ = bot_clone.send_message(chat_id_clone, "❌ Gagal mendapatkan harga SOL. Coba lagi.").await;
-                                        return;
-                                    }
-                                    let buy_amount_sol = buy_usd / sol_price_usd;
+                                    
+                                    let buy_amount_sol = if buy_cur == "SOL" {
+                                        buy_val
+                                    } else {
+                                        let sol_price_usd = fetch_sol_price_usd().await.unwrap_or(0.0);
+                                        if sol_price_usd == 0.0 {
+                                            let _ = bot_clone.send_message(chat_id_clone, "❌ Gagal mendapatkan harga SOL. Coba lagi.").await;
+                                            return;
+                                        }
+                                        buy_val / sol_price_usd
+                                    };
+                                    
                                     let sol_lam = (buy_amount_sol * 1e9) as u64;
                                     let slippage_scaled = (90.0_f64 / 100.0 * 1_000_000.0) as u64;
                                     let slippage_val = fastnum::UD128::from(slippage_scaled) / fastnum::UD128::from(1_000_000u64);
+                                    let success_text = format!(
+                                                "✅ *Swap Buy Ditempatkan!*\n\n\
+                                                🏦 Token: `{}`\n\
+                                                💰 Amount: `{:.2} {}` (≈ `{:.6} SOL`)\n\
+                                                ⚡ Tip: {} SOL | ⛽ Prio: {} SOL\n\n\
+                                                _Transaksi telah dikirim ke Aura (Market Swap)._",
+                                                token, buy_val, buy_cur, buy_amount_sol, tip_fee, prio_fee
+                                            );
                                     let req = tonic::Request::new(MarketTrade {
                                         wallet: None,
                                         amount: SwapAmount::Buy(decisol::QuoteLamports::Lamports(decisol::Lamports::from(sol_lam))),
@@ -2731,14 +2788,6 @@ async fn handle_callback(
                                     });
                                     match client.aura().trade((), req).await {
                                         Ok(_) => {
-                                            let success_text = format!(
-                                                "✅ *Swap Buy Berhasil!*\n\n\
-                                                🏦 Token: `{}`\n\
-                                                💰 Jumlah: ${:.2} ({:.4} SOL)\n\
-                                                ⚡ Tip: {} SOL | ⛽ Prio: {} SOL\n\n\
-                                                _Transaksi telah dikirim ke Aura (Market Swap)._",
-                                                token, buy_usd, buy_amount_sol, tip_fee, prio_fee
-                                            );
                                             let _ = bot_clone.send_message(chat_id_clone, success_text)
                                                 .parse_mode(teloxide::types::ParseMode::Markdown).await;
                                         }
@@ -2763,7 +2812,8 @@ async fn handle_callback(
             "place_limit_buy" => {
                 if let Some(token) = st.active_token.clone() {
                     let target_str = st.buy_target.clone();
-                    let buy_sol = st.buy_amount_usd; // field menyimpan SOL amount
+                    let buy_val = st.buy_amount;
+                    let buy_cur = st.buy_currency.clone();
                     let tip_fee = st.buy_tip_fee;
                     let prio_fee = st.buy_prio_fee;
                     let order_id = st.next_order_id;
@@ -2771,7 +2821,7 @@ async fn handle_callback(
                     let o = LimitOrder {
                         id: order_id,
                         token: token.clone(),
-                        amount_usd: buy_sol,
+                        amount_usd: buy_val,
                         target: target_str.clone(),
                         tip_fee,
                         prio_fee,
@@ -2780,7 +2830,7 @@ async fn handle_callback(
                     // Save to SQLite
                     let mut db_id = 0;
                     if let Ok(conn) = st.db_conn.try_lock() {
-                        if let Ok(id) = db::insert_limit_order(&conn, "BUY", &token, &target_str, tip_fee, prio_fee, buy_sol) {
+                        if let Ok(id) = db::insert_limit_order(&conn, "BUY", &token, &target_str, tip_fee, prio_fee, buy_val) {
                             db_id = id;
                         }
                     }
@@ -2812,17 +2862,22 @@ async fn handle_callback(
                             let tip_lam = (tip_fee * 1e9) as u64;
                             let prio_lam = (prio_fee * 1e9) as u64;
 
-                            // Fetch SOL price from Binance API (was Jupiter)
+                            // Selalu fetch harga SOL — dibutuhkan untuk konversi amount USD dan target harga USD
                             let sol_price_usd = match fetch_sol_price_usd().await {
                                 Some(price) => price,
                                 None => {
-                                    let _ = bot_clone.send_message(chat_id, "❌ Gagal mengambil harga SOL dari API (harga saat ini). Batal mengirim order ke Aura.").await;
+                                    let _ = bot_clone.send_message(chat_id, "❌ Gagal mengambil harga SOL dari API. Batal mengirim order ke Aura.").await;
                                     return;
                                 }
                             };
 
-                            // Convert USD amount → lamports using fetched SOL price
-                            let buy_amount_sol = buy_sol / sol_price_usd; // buy_sol is actually buy_amount_usd
+                            // Hitung buy_amount_sol tergantung currency
+                            let buy_amount_sol = if buy_cur == "SOL" {
+                                buy_val
+                            } else {
+                                buy_val / sol_price_usd
+                            };
+
                             let sol_lam = (buy_amount_sol * 1e9) as u64;
                             let buy_amount = SwapAmount::Buy(decisol::QuoteLamports::Lamports(
                                 decisol::Lamports::from(sol_lam),
